@@ -338,6 +338,12 @@ static counter_t RUU_fcount;		/* cumulative RUU full count */
 static counter_t LSQ_count;		/* cumulative LSQ occupancy */
 static counter_t LSQ_fcount;		/* cumulative LSQ full count */
 
+static counter_t NRP_count;
+static counter_t NRP_fetches;
+static counter_t NRP_hits;
+static counter_t NRP_latency;
+static counter_t NRP_evictions;
+
 /* total non-speculative bogus addresses seen (debug var) */
 static counter_t sim_invalid_addrs;
 
@@ -1285,6 +1291,16 @@ sim_reg_stats(struct stat_sdb_t *sdb)   /* stats database */
   stat_reg_formula(sdb, "lsq_full", "fraction of time (cycle's) LSQ was full",
                    "LSQ_fcount / sim_cycle", /* format */NULL);
 
+  stat_reg_counter(sdb, "NRP_fetches", "total number NRP fetches", &NRP_fetches, 0, NULL);
+  stat_reg_counter(sdb, "NRP_hits", "total number of NRP hits", &NRP_hits, 0, NULL);
+  stat_reg_counter(sdb, "NRP_latency", "total latency for NRP hits", &NRP_latency, 0, NULL);
+  stat_reg_counter(sdb, "NRP_count", "cumulative NRP occupancy", &NRP_count, 0, NULL);
+  stat_reg_formula(sdb, "nrp_occupancy", "avg occupancy of NRP entries in RUU", "NRP_count / sim_cycle", NULL);
+  stat_reg_counter(sdb, "NRP_evictions", "total number of NRP evictions", &NRP_evictions, 0, NULL);
+  stat_reg_formula(sdb, "nrp_avg_latency", "avg NRP hit latency", "NRP_latency / NRP_hits", NULL);
+
+  stat_reg_formula(sdb, "ruu_true_count", "RUU occupancy count due to instructions and NRP", "NRP_count + RUU_count", NULL);
+
   stat_reg_counter(sdb, "sim_slip",
                    "total number of slip cycles",
                    &sim_slip, 0, NULL);
@@ -1361,6 +1377,7 @@ static void readyq_init(void);
 static void cv_init(void);
 static void tracer_init(void);
 static void fetch_init(void);
+static void nrp_init(void);
 
 /* initialize the simulator */
 void
@@ -1434,6 +1451,7 @@ sim_load_prog(char *fname,		/* program to load */
   readyq_init();
   ruu_init();
   lsq_init();
+  nrp_init();
 
   /* initialize the DLite debugger */
   dlite_init(simoo_reg_obj, simoo_mem_obj, simoo_mstate_obj);
@@ -1607,6 +1625,156 @@ ruu_dump(FILE *stream)				/* output stream */
       head = (head + 1) % RUU_size;
       num--;
     }
+}
+
+/* Nonbinding register prefetch unit (NRP): prefetches values into the RUU if there are empty RUU entries
+ * prefetches are made when:
+ *    1) An empty RUU entry exists
+ *    2) There is at least one available load port
+ *
+ * prefetch value entries are evicted when:
+ *    1) A RUU entry is required by proper operation
+ *    2) The RUU entry is too old (dependent on eviction policy)
+ *
+ * Note that for simulation purposes the NRP data structure is separate from the RUU structure 
+ * but in actual implementation, they need not be separate. NRP linked lists is a circular linked list that starts and ends
+ * with a dummy node;
+ */
+
+struct NRP_station {
+	md_addr_t addr; //address from which the value was prefetched
+	int busy; //counts cycles until value is ready (0 = ready)
+	struct NRP_station* next;
+	struct NRP_station* prev;
+};
+
+static int NRP_num = 0; //number of RUU stations used as NRP station
+static struct NRP_station* NRP_list = NULL;
+static md_addr_t prefetch_address = 0;
+
+static void nrp_init() {
+	NRP_list = (struct NRP_station*)malloc(sizeof(struct NRP_station));
+	NRP_list->busy = -1;
+	NRP_list->next = NRP_list;
+	NRP_list->prev = NRP_list;
+
+	NRP_hits = NRP_fetches = NRP_count = NRP_evictions = NRP_latency = 0;
+}
+
+static void nrp_cleanup() {
+	struct NRP_station* node = NRP_list->next;
+	while (node != NRP_list) {
+		struct NRP_station* nnode = node->next;
+		free(node);
+		node = nnode;
+	}
+	free(NRP_list);
+	NRP_list = NULL;
+	NRP_num = 0;
+}
+
+/* attempts to fetch data from nrp
+ * returns latency of access or -1 if not in NRP
+ */
+static int nrp_address_fetch(md_addr_t addr) {
+	NRP_fetches++;
+
+	struct NRP_station* node = NRP_list->next;
+	int lat = -1;
+	while (node != NRP_list) {
+		if (node->busy >= 0 && node->addr == addr) {
+			lat = node->busy;
+			break;
+		}
+		node = node->next;
+	}
+	if (lat != -1) {
+		NRP_hits++;
+		NRP_latency += lat;
+
+		//remove node from queue
+		struct NRP_station* prev = node->prev;
+		struct NRP_station* next = node->next;
+		prev->next = next;
+		next->prev = prev;
+		free(node);
+		--NRP_num;
+	}
+	return lat;
+}
+
+/* determines whether an address has already been prefetched */
+static int nrp_address_prefected(md_addr_t addr) {
+	struct NRP_station* node = NRP_list->next;
+	while (node != NRP_list) {
+		if (node->busy >= 0 && node->addr == addr) {
+			return 1;
+		}
+		node = node->next;
+	}
+	return 0;
+}
+
+/* evict an entry to make space for actual instructions */
+static void nrp_evict() {
+	NRP_evictions++;
+
+	//eviction policy: evict oldest block
+	struct NRP_station* node = NRP_list->prev;
+	struct NRP_station* prev = node->prev;
+	prev->next = NRP_list;
+	NRP_list->prev = prev;
+	free(node);
+	--NRP_num;
+}
+
+/* update load entries in nrp */
+static void nrp_update() {
+	NRP_count += NRP_num;
+
+	struct NRP_station* node = NRP_list->next;
+	while (node != NRP_list) {
+		if (node->busy > 0)
+			--node->busy;
+		node = node->next;
+	}
+}
+
+/* issues prefetching operations */
+static void nrp_prefetch() {
+	if (prefetch_address == 0)
+		return;
+
+	//perform prefetch
+	md_addr_t addr = prefetch_address;
+
+	/* is RUU full? */
+	if (NRP_num + RUU_num == RUU_size)
+		return;
+
+	//get functional unit
+	struct res_template* fu = res_get(fu_pool, RdPort);
+	if (fu) {
+		fu->master->busy = fu->issuelat;
+
+		//insert node into RUU
+		struct NRP_station* node = (struct NRP_station*) malloc(sizeof(struct NRP_station*));
+		node->prev = NRP_list;
+		node->next = NRP_list->next;
+		node->addr = addr;
+		node->busy = cache_il1_lat;
+		NRP_list->next->prev = node;
+		NRP_list->next = node;
+		++NRP_num;
+
+		prefetch_address = 0;
+	}
+}
+
+/* collects data for prefetching purposes */
+static void nrp_prefetch_process(md_addr_t addr) {
+	if (!nrp_address_prefected(addr + 1))
+		prefetch_address = addr + 1;
 }
 
 /*
@@ -2725,9 +2893,14 @@ ruu_issue(void)
 
 			      if (!spec_mode && !valid_addr)
 				sim_invalid_addrs++;
-
+				  /* check NRP for values*/
+				  int nrp_lat = nrp_address_fetch(rs->addr);
+				  if (valid_addr && nrp_lat != -1) {
+					  /* hit in NRP */
+					  load_lat = nrp_lat + 1;
+				  }
 			      /* no! go to the data cache if addr is valid */
-			      if (cache_dl1 && valid_addr)
+				  else  if (cache_dl1 && valid_addr)
 				{
 				  /* access the cache if non-faulting */
 				  load_lat =
@@ -3735,6 +3908,11 @@ ruu_dispatch(void)
 	 /* on an acceptable trace path */
 	 && (ruu_include_spec || !spec_mode))
     {
+	  /* if RUU entries are filled with NRP, free an entry */
+	  if (RUU_num + NRP_num == RUU_size) {
+		  nrp_evict();
+	  }
+
       /* if issuing in-order, block until last op issues if inorder issue */
       if (ruu_inorder_issue
 	  && (last_op.rs && RSLINK_VALID(&last_op)
@@ -3863,6 +4041,11 @@ ruu_dispatch(void)
 		sim_num_loads++;
 	    }
 	}
+
+	  /* process prefetch */
+	  if (MD_OP_FLAGS(op) & F_LOAD) {
+		  nrp_prefetch_process(regs.regs_R[RB] + SEXT(OFS));
+	  }
 
       br_taken = (regs.regs_NPC != (regs.regs_PC + sizeof(md_inst_t)));
       br_pred_taken = (pred_PC != (regs.regs_PC + sizeof(md_inst_t)));
@@ -4550,6 +4733,9 @@ sim_main(void)
       /* service function unit release events */
       ruu_release_fu();
 
+	  /* keep prefetching */
+	  nrp_update();
+
       /* ==> may have ready queue entries carried over from previous cycles */
 
       /* service result completions, also readies dependent operations */
@@ -4588,6 +4774,9 @@ sim_main(void)
       else
 	ruu_fetch_issue_delay--;
 
+	  /* perform any prefetching */
+	  nrp_prefetch();
+
       /* update buffer occupancy stats */
       IFQ_count += fetch_num;
       IFQ_fcount += ((fetch_num == ruu_ifq_size) ? 1 : 0);
@@ -4600,7 +4789,10 @@ sim_main(void)
       sim_cycle++;
 
       /* finish early? */
-      if (max_insts && sim_num_insn >= max_insts)
-	return;
+	  if (max_insts && sim_num_insn >= max_insts) {
+		  nrp_cleanup();
+		  return;
+	  }
     }
+  nrp_cleanup();
 }
