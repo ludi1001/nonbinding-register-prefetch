@@ -887,7 +887,7 @@ sim_reg_options(struct opt_odb_t *odb)
 	       &bugcompat_mode, /* default */FALSE, /* print */TRUE, NULL);
 
   opt_reg_flag(odb, "-nrp:mode", "nonbinding register prefetch mode", &nrp_mode, 0, TRUE, NULL);
-  opt_reg_flag(odb, "-nrp:timeout", "max NRP timer count", &nrp_max_eviction_timer_count, 16, TRUE, NULL);
+  opt_reg_int(odb, "-nrp:timeout", "max NRP timer count", &nrp_max_eviction_timer_count, 16, TRUE, NULL);
 }
 
 /* check simulator-specific option values */
