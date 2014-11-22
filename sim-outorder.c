@@ -347,6 +347,8 @@ static counter_t NRP_hits;
 static counter_t NRP_latency;
 static counter_t NRP_forced_evictions;
 static counter_t NRP_timeout_evictions;
+static counter_t NRP_fetch_miss_count;
+static counter_t NRP_fetch_attempts;
 
 /* total non-speculative bogus addresses seen (debug var) */
 static counter_t sim_invalid_addrs;
@@ -1297,7 +1299,7 @@ sim_reg_stats(struct stat_sdb_t *sdb)   /* stats database */
   stat_reg_formula(sdb, "lsq_full", "fraction of time (cycle's) LSQ was full",
                    "LSQ_fcount / sim_cycle", /* format */NULL);
 
-  stat_reg_counter(sdb, "NRP_fetches", "total number NRP fetches", &NRP_fetches, 0, NULL);
+  stat_reg_counter(sdb, "NRP_fetches", "total number successful NRP fetches", &NRP_fetches, 0, NULL);
   stat_reg_counter(sdb, "NRP_hits", "total number of NRP hits", &NRP_hits, 0, NULL);
   stat_reg_formula(sdb, "nrp_hit_rate", "hit rate in NRP", "NRP_hits / NRP_fetches", NULL);
   stat_reg_counter(sdb, "NRP_latency", "total latency for NRP hits", &NRP_latency, 0, NULL);
@@ -1310,6 +1312,9 @@ sim_reg_stats(struct stat_sdb_t *sdb)   /* stats database */
   stat_reg_formula(sdb, "nrp_evictions", "total number of evictions", "NRP_forced_evictions + NRP_timeout_evictions", NULL);
   stat_reg_formula(sdb, "nrp_eviction_rate", "avg NRP evictions", "nrp_evictions / sim_cycle", NULL);
   stat_reg_formula(sdb, "nrp_avg_latency", "avg NRP hit latency", "NRP_latency / NRP_hits", NULL);
+  stat_reg_counter(sdb, "NRP_fetch_attempts", "number of fetch attempts", &NRP_fetch_attempts, 0, NULL);
+  stat_reg_counter(sdb, "NRP_fetch_miss_count", "number of prefetch attempts to data not in L1", &NRP_fetch_miss_count, 0, NULL);
+  stat_reg_formula(sdb, "nrp_fetch_miss_prop", "proportion of prefetch attempts that miss in L1", "NRP_fetch_miss_count / NRP_fetch_attempts", NULL);
 
   stat_reg_formula(sdb, "ruu_true_count", "RUU count + NRP count", "NRP_count + RUU_count", NULL);
   stat_reg_formula(sdb, "ruu_true_occupany", "avg RUU occupancy", "ruu_true_count / sim_cycle", NULL);
@@ -1792,13 +1797,17 @@ static int nrp_insert(md_addr_t addr) {
 	if (nrp_mode == 0)
 		return 0;
 
+	NRP_fetch_attempts++;
+
 	/* is RUU full? */
 	if (NRP_num + RUU_num == RUU_size)
 		return 0;
 
 	//make sure in L1 cache
-	if (!cache_probe(cache_dl1, addr))
+	if (!cache_probe(cache_dl1, addr)) {
+		NRP_fetch_miss_count++;
 		return 0;
+	}
 
 	struct res_template* fu = res_get(fu_pool, RdPort);
 	if (fu) {
