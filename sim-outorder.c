@@ -1770,6 +1770,7 @@ static void nrp_update() {
 		if (node->eviction_time == nrp_global_eviction_timer) {
 			NRP_timeout_evictions++;
 
+
 			struct NRP_station* prev = node->prev;
 			struct NRP_station* next = node->next;
 			prev->next = next;
