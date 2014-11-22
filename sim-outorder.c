@@ -345,7 +345,8 @@ static counter_t NRP_count;
 static counter_t NRP_fetches;
 static counter_t NRP_hits;
 static counter_t NRP_latency;
-static counter_t NRP_evictions;
+static counter_t NRP_forced_evictions;
+static counter_t NRP_timeout_evictions;
 
 /* total non-speculative bogus addresses seen (debug var) */
 static counter_t sim_invalid_addrs;
@@ -1302,8 +1303,12 @@ sim_reg_stats(struct stat_sdb_t *sdb)   /* stats database */
   stat_reg_counter(sdb, "NRP_latency", "total latency for NRP hits", &NRP_latency, 0, NULL);
   stat_reg_counter(sdb, "NRP_count", "cumulative NRP occupancy", &NRP_count, 0, NULL);
   stat_reg_formula(sdb, "nrp_occupancy", "avg occupancy of NRP entries in RUU", "NRP_count / sim_cycle", NULL);
-  stat_reg_counter(sdb, "NRP_evictions", "total number of NRP evictions", &NRP_evictions, 0, NULL);
-  stat_reg_formula(sdb, "nrp_eviction_rate", "avg NRP eviction rate", "NRP_evictions / sim_cycle", NULL);
+  stat_reg_counter(sdb, "NRP_forced_evictions", "number of forced NRP evictions", &NRP_forced_evictions, 0, NULL);
+  stat_reg_formula(sdb, "nrp_forced_eviction_rate", "avg NRP forced eviction rate", "NRP_forced_evictions / sim_cycle", NULL);
+  stat_reg_counter(sdb, "NRP_timeout_evictions", "number of timeout NRP evictions", &NRP_timeout_evictions, 0, NULL);
+  stat_reg_formula(sdb, "nrp_timeout_eviction_rate", "avg NRP forced eviction rate", "NRP_timeout_evictions / sim_cycle", NULL);
+  stat_reg_formula(sdb, "nrp_evictions", "total number of evictions", "NRP_forced_evictions + NRP_timeout_evictions", NULL);
+  stat_reg_formula(sdb, "nrp_eviction_rate", "avg NRP evictions", "nrp_evictions / sim_cycle", NULL);
   stat_reg_formula(sdb, "nrp_avg_latency", "avg NRP hit latency", "NRP_latency / NRP_hits", NULL);
 
   stat_reg_formula(sdb, "ruu_true_count", "RUU count + NRP count", "NRP_count + RUU_count", NULL);
@@ -1651,11 +1656,14 @@ ruu_dump(FILE *stream)				/* output stream */
 struct NRP_station {
 	md_addr_t addr; //address from which the value was prefetched
 	int busy; //counts cycles until value is ready (0 = ready)
+	int eviction_time; 
 	struct NRP_station* next;
 	struct NRP_station* prev;
 };
 
 static int NRP_num = 0; //number of RUU stations used as NRP station
+static int nrp_global_eviction_timer = 0; //eviction timer
+const int NRP_MAX_GLOBAL_EVICTION_COUNT = 16;
 static struct NRP_station* NRP_list = NULL;
 static md_addr_t prefetch_address = 0;
 
@@ -1664,8 +1672,9 @@ static void nrp_init() {
 	NRP_list->busy = -1;
 	NRP_list->next = NRP_list;
 	NRP_list->prev = NRP_list;
+	NRP_list->eviction_time = -1;
 
-	NRP_hits = NRP_fetches = NRP_count = NRP_evictions = NRP_latency = 0;
+	NRP_hits = NRP_fetches = NRP_count = NRP_forced_evictions = NRP_timeout_evictions = NRP_latency = 0;
 }
 
 static void nrp_cleanup() {
@@ -1731,7 +1740,7 @@ static void nrp_evict() {
 	if (nrp_mode == 0)
 		return;
 
-	NRP_evictions++;
+	NRP_forced_evictions++;
 
 	//eviction policy: evict oldest block
 	struct NRP_station* node = NRP_list->prev;
@@ -1749,12 +1758,31 @@ static void nrp_update() {
 
 	NRP_count += NRP_num;
 
+	nrp_global_eviction_timer++;
+	if (nrp_global_eviction_timer >= NRP_MAX_GLOBAL_EVICTION_COUNT) {
+		nrp_global_eviction_timer = 0;
+	}
+
 	struct NRP_station* node = NRP_list->next;
 	while (node != NRP_list) {
 		if (node->busy > 0)
 			--node->busy;
+		if (node->eviction_time == nrp_global_eviction_timer) {
+			NRP_timeout_evictions++;
+
+			struct NRP_station* prev = node->prev;
+			struct NRP_station* next = node->next;
+			prev->next = next;
+			next->prev = prev;
+			free(node);
+			--NRP_num;
+		}
 		node = node->next;
 	}
+
+
+
+
 }
 
 /* insert address in NRP */
@@ -1764,6 +1792,10 @@ static int nrp_insert(md_addr_t addr) {
 
 	/* is RUU full? */
 	if (NRP_num + RUU_num == RUU_size)
+		return 0;
+
+	//make sure in L1 cache
+	if (!cache_probe(cache_dl1, addr))
 		return 0;
 
 	struct res_template* fu = res_get(fu_pool, RdPort);
@@ -1776,6 +1808,7 @@ static int nrp_insert(md_addr_t addr) {
 		node->next = NRP_list->next;
 		node->addr = addr;
 		node->busy = cache_il1_lat;
+		node->eviction_time = nrp_global_eviction_timer;
 		NRP_list->next->prev = node;
 		NRP_list->next = node;
 		++NRP_num;
@@ -1801,6 +1834,7 @@ static void nrp_prefetch() {
 		while (nrp_address_prefetched(addr))
 			addr = addr + 1;
 	} while (nrp_insert(addr));
+	prefetch_address = addr;
 }
 
 /* collects data for prefetching purposes */
@@ -4767,11 +4801,14 @@ sim_main(void)
       /* commit entries from RUU/LSQ to architected register file */
       ruu_commit();
 
+	  /* perform any prefetching */
+	  nrp_prefetch();
+
       /* service function unit release events */
       ruu_release_fu();
 
 	  /* keep prefetching */
-	  //nrp_update();
+	  nrp_update();
 
       /* ==> may have ready queue entries carried over from previous cycles */
 
@@ -4810,9 +4847,6 @@ sim_main(void)
 	ruu_fetch();
       else
 	ruu_fetch_issue_delay--;
-
-	  /* perform any prefetching */
-	  //nrp_prefetch();
 
       /* update buffer occupancy stats */
       IFQ_count += fetch_num;
