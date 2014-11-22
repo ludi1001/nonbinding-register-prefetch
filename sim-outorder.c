@@ -4771,7 +4771,7 @@ sim_main(void)
       ruu_release_fu();
 
 	  /* keep prefetching */
-	  nrp_update();
+	  //nrp_update();
 
       /* ==> may have ready queue entries carried over from previous cycles */
 
@@ -4812,7 +4812,7 @@ sim_main(void)
 	ruu_fetch_issue_delay--;
 
 	  /* perform any prefetching */
-	  nrp_prefetch();
+	  //nrp_prefetch();
 
       /* update buffer occupancy stats */
       IFQ_count += fetch_num;
