@@ -1312,6 +1312,7 @@ sim_reg_stats(struct stat_sdb_t *sdb)   /* stats database */
   stat_reg_formula(sdb, "nrp_avg_latency", "avg NRP hit latency", "NRP_latency / NRP_hits", NULL);
 
   stat_reg_formula(sdb, "ruu_true_count", "RUU count + NRP count", "NRP_count + RUU_count", NULL);
+  stat_reg_formula(sdb, "ruu_true_occupany", "avg RUU occupancy", "ruu_true_count / sim_cycle", NULL);
 
   stat_reg_counter(sdb, "sim_slip",
                    "total number of slip cycles",
