@@ -219,6 +219,9 @@ static int res_fpalu;
 /* total number of floating point multiplier/dividers available */
 static int res_fpmult;
 
+/* NRP mode */
+static int nrp_mode;
+
 /* text-based stat profiles */
 #define MAX_PCSTAT_VARS 8
 static int pcstat_nelt = 0;
@@ -878,6 +881,8 @@ sim_reg_options(struct opt_odb_t *odb)
   opt_reg_flag(odb, "-bugcompat",
 	       "operate in backward-compatible bugs mode (for testing only)",
 	       &bugcompat_mode, /* default */FALSE, /* print */TRUE, NULL);
+
+  opt_reg_flag(odb, "-nrp:mode", "nonbinding register prefetch mode", &nrp_mode, 0, TRUE, NULL);
 }
 
 /* check simulator-specific option values */
@@ -1293,13 +1298,15 @@ sim_reg_stats(struct stat_sdb_t *sdb)   /* stats database */
 
   stat_reg_counter(sdb, "NRP_fetches", "total number NRP fetches", &NRP_fetches, 0, NULL);
   stat_reg_counter(sdb, "NRP_hits", "total number of NRP hits", &NRP_hits, 0, NULL);
+  stat_reg_formula(sdb, "nrp_hit_rate", "hit rate in NRP", "NRP_hits / NRP_fetches", NULL);
   stat_reg_counter(sdb, "NRP_latency", "total latency for NRP hits", &NRP_latency, 0, NULL);
   stat_reg_counter(sdb, "NRP_count", "cumulative NRP occupancy", &NRP_count, 0, NULL);
   stat_reg_formula(sdb, "nrp_occupancy", "avg occupancy of NRP entries in RUU", "NRP_count / sim_cycle", NULL);
   stat_reg_counter(sdb, "NRP_evictions", "total number of NRP evictions", &NRP_evictions, 0, NULL);
+  stat_reg_formula(sdb, "nrp_eviction_rate", "avg NRP eviction rate", "NRP_evictions / sim_cycle", NULL);
   stat_reg_formula(sdb, "nrp_avg_latency", "avg NRP hit latency", "NRP_latency / NRP_hits", NULL);
 
-  stat_reg_formula(sdb, "ruu_true_count", "RUU occupancy count due to instructions and NRP", "NRP_count + RUU_count", NULL);
+  stat_reg_formula(sdb, "ruu_true_count", "RUU count + NRP count", "NRP_count + RUU_count", NULL);
 
   stat_reg_counter(sdb, "sim_slip",
                    "total number of slip cycles",
@@ -1677,7 +1684,8 @@ static void nrp_cleanup() {
  * returns latency of access or -1 if not in NRP
  */
 static int nrp_address_fetch(md_addr_t addr) {
-	NRP_fetches++;
+	if (nrp_mode == 0)
+		return -1;
 
 	struct NRP_station* node = NRP_list->next;
 	int lat = -1;
@@ -1704,7 +1712,10 @@ static int nrp_address_fetch(md_addr_t addr) {
 }
 
 /* determines whether an address has already been prefetched */
-static int nrp_address_prefected(md_addr_t addr) {
+static int nrp_address_prefetched(md_addr_t addr) {
+	if (nrp_mode == 0)
+		return 0;
+
 	struct NRP_station* node = NRP_list->next;
 	while (node != NRP_list) {
 		if (node->busy >= 0 && node->addr == addr) {
@@ -1717,6 +1728,9 @@ static int nrp_address_prefected(md_addr_t addr) {
 
 /* evict an entry to make space for actual instructions */
 static void nrp_evict() {
+	if (nrp_mode == 0)
+		return;
+
 	NRP_evictions++;
 
 	//eviction policy: evict oldest block
@@ -1730,6 +1744,9 @@ static void nrp_evict() {
 
 /* update load entries in nrp */
 static void nrp_update() {
+	if (nrp_mode == 0)
+		return;
+
 	NRP_count += NRP_num;
 
 	struct NRP_station* node = NRP_list->next;
@@ -1740,25 +1757,21 @@ static void nrp_update() {
 	}
 }
 
-/* issues prefetching operations */
-static void nrp_prefetch() {
-	if (prefetch_address == 0)
-		return;
-
-	//perform prefetch
-	md_addr_t addr = prefetch_address;
+/* insert address in NRP */
+static int nrp_insert(md_addr_t addr) {
+	if (nrp_mode == 0)
+		return 0;
 
 	/* is RUU full? */
 	if (NRP_num + RUU_num == RUU_size)
-		return;
+		return 0;
 
-	//get functional unit
 	struct res_template* fu = res_get(fu_pool, RdPort);
 	if (fu) {
 		fu->master->busy = fu->issuelat;
 
 		//insert node into RUU
-		struct NRP_station* node = (struct NRP_station*) malloc(sizeof(struct NRP_station*));
+		struct NRP_station* node = (struct NRP_station*) malloc(sizeof(struct NRP_station));
 		node->prev = NRP_list;
 		node->next = NRP_list->next;
 		node->addr = addr;
@@ -1766,14 +1779,36 @@ static void nrp_prefetch() {
 		NRP_list->next->prev = node;
 		NRP_list->next = node;
 		++NRP_num;
+		NRP_fetches++;
 
-		prefetch_address = 0;
+		return 1;
 	}
+	return 0;
+}
+
+/* issues prefetching operations */
+static void nrp_prefetch() {
+	if (nrp_mode == 0)
+		return;
+
+	if (prefetch_address == 0)
+		return;
+
+	//perform prefetch
+	md_addr_t addr = prefetch_address;
+
+	do {
+		while (nrp_address_prefetched(addr))
+			addr = addr + 1;
+	} while (nrp_insert(addr));
 }
 
 /* collects data for prefetching purposes */
 static void nrp_prefetch_process(md_addr_t addr) {
-	if (!nrp_address_prefected(addr + 1))
+	if (nrp_mode == 0)
+		return;
+
+	if (!nrp_address_prefetched(addr + 1))
 		prefetch_address = addr + 1;
 }
 
@@ -2895,7 +2930,7 @@ ruu_issue(void)
 				sim_invalid_addrs++;
 				  /* check NRP for values*/
 				  int nrp_lat = nrp_address_fetch(rs->addr);
-				  if (valid_addr && nrp_lat != -1) {
+				  if (valid_addr && nrp_lat >= 0) {
 					  /* hit in NRP */
 					  load_lat = nrp_lat + 1;
 				  }
@@ -4042,10 +4077,7 @@ ruu_dispatch(void)
 	    }
 	}
 
-	  /* process prefetch */
-	  if (MD_OP_FLAGS(op) & F_LOAD) {
-		  nrp_prefetch_process(regs.regs_R[RB] + SEXT(OFS));
-	  }
+
 
       br_taken = (regs.regs_NPC != (regs.regs_PC + sizeof(md_inst_t)));
       br_pred_taken = (pred_PC != (regs.regs_PC + sizeof(md_inst_t)));
@@ -4140,6 +4172,11 @@ ruu_dispatch(void)
 	      lsq->seq = ++inst_seq;
 	      lsq->queued = lsq->issued = lsq->completed = FALSE;
 	      lsq->ptrace_seq = ptrace_seq++;
+
+		  /* process prefetch */
+		  if (MD_OP_FLAGS(op) & F_LOAD) {
+			  nrp_prefetch_process(addr);
+		  }
 
 	      /* pipetrace this uop */
 	      ptrace_newuop(lsq->ptrace_seq, "internal ld/st", lsq->PC, 0);
