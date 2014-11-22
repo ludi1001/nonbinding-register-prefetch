@@ -221,6 +221,7 @@ static int res_fpmult;
 
 /* NRP mode */
 static int nrp_mode;
+static int nrp_max_eviction_timer_count;
 
 /* text-based stat profiles */
 #define MAX_PCSTAT_VARS 8
@@ -886,6 +887,7 @@ sim_reg_options(struct opt_odb_t *odb)
 	       &bugcompat_mode, /* default */FALSE, /* print */TRUE, NULL);
 
   opt_reg_flag(odb, "-nrp:mode", "nonbinding register prefetch mode", &nrp_mode, 0, TRUE, NULL);
+  opt_reg_flag(odb, "-nrp:timeout", "max NRP timer count", &nrp_max_eviction_timer_count, 16, TRUE, NULL);
 }
 
 /* check simulator-specific option values */
@@ -1669,7 +1671,6 @@ struct NRP_station {
 
 static int NRP_num = 0; //number of RUU stations used as NRP station
 static int nrp_global_eviction_timer = 0; //eviction timer
-const int NRP_MAX_GLOBAL_EVICTION_COUNT = 16;
 static struct NRP_station* NRP_list = NULL;
 static md_addr_t prefetch_address = 0;
 
@@ -1765,7 +1766,7 @@ static void nrp_update() {
 	NRP_count += NRP_num;
 
 	nrp_global_eviction_timer++;
-	if (nrp_global_eviction_timer >= NRP_MAX_GLOBAL_EVICTION_COUNT) {
+	if (nrp_global_eviction_timer >= nrp_max_eviction_timer_count) {
 		nrp_global_eviction_timer = 0;
 	}
 
