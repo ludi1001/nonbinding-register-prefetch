@@ -1818,7 +1818,7 @@ static int nrp_insert(md_addr_t addr) {
 		node->prev = NRP_list;
 		node->next = NRP_list->next;
 		node->addr = addr;
-		node->busy = cache_il1_lat;
+		node->busy = cache_dl1_lat;
 		node->eviction_time = nrp_global_eviction_timer;
 		NRP_list->next->prev = node;
 		NRP_list->next = node;
