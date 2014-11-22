@@ -1314,7 +1314,6 @@ sim_reg_stats(struct stat_sdb_t *sdb)   /* stats database */
   stat_reg_formula(sdb, "nrp_timeout_eviction_rate", "avg NRP forced eviction rate", "NRP_timeout_evictions / sim_cycle", NULL);
   stat_reg_formula(sdb, "nrp_evictions", "total number of evictions", "NRP_forced_evictions + NRP_timeout_evictions", NULL);
   stat_reg_formula(sdb, "nrp_eviction_rate", "avg NRP evictions", "nrp_evictions / sim_cycle", NULL);
-  stat_reg_formula(sdb, "nrp_avg_latency", "avg NRP hit latency", "NRP_latency / NRP_hits", NULL);
   stat_reg_counter(sdb, "NRP_fetch_attempts", "number of fetch attempts", &NRP_fetch_attempts, 0, NULL);
   stat_reg_counter(sdb, "NRP_fetch_miss_count", "number of prefetch attempts to data not in L1", &NRP_fetch_miss_count, 0, NULL);
   stat_reg_formula(sdb, "nrp_fetch_miss_prop", "proportion of prefetch attempts that miss in L1", "NRP_fetch_miss_count / NRP_fetch_attempts", NULL);
