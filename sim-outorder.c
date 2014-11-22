@@ -1305,6 +1305,7 @@ sim_reg_stats(struct stat_sdb_t *sdb)   /* stats database */
   stat_reg_counter(sdb, "NRP_hits", "total number of NRP hits", &NRP_hits, 0, NULL);
   stat_reg_formula(sdb, "nrp_hit_rate", "hit rate in NRP", "NRP_hits / NRP_fetches", NULL);
   stat_reg_counter(sdb, "NRP_latency", "total latency for NRP hits", &NRP_latency, 0, NULL);
+  stat_reg_formula(sdb, "nrp_avg_latency", "avg latency for hits", "NRP_latency / NRP_hits", NULL);
   stat_reg_counter(sdb, "NRP_count", "cumulative NRP occupancy", &NRP_count, 0, NULL);
   stat_reg_formula(sdb, "nrp_occupancy", "avg occupancy of NRP entries in RUU", "NRP_count / sim_cycle", NULL);
   stat_reg_counter(sdb, "NRP_forced_evictions", "number of forced NRP evictions", &NRP_forced_evictions, 0, NULL);
