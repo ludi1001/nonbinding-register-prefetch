@@ -1980,7 +1980,7 @@ static void nrp_prefetch_stride_PC(struct NRP_prefetch_mode* this) {
 	struct NRP_prefetch_mode_stride_PC* data = this->data;
 	int i = 0;
 	for (i = 0; i < nrp_rpt_size; ++i) {
-		if (data->RPT[i].just_modified && data->RPT[i].state == 2) {
+		if (data->RPT[i].just_modified && (data->RPT[i].state == 2 || data->RPT[i].state == 1)) {
 			nrp_insert(data->RPT[i].last_load_addr + data->RPT[i].stride);
 		}
 		data->RPT[i].just_modified = 0;
