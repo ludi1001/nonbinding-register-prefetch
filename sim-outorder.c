@@ -224,6 +224,8 @@ static int nrp_mode;
 static int nrp_max_eviction_timer_count;
 static int nrp_max_stride;
 static int nrp_rpt_size;
+static int nrp_rpt_assoc;
+static int nrp_markov_len;
 
 /* text-based stat profiles */
 #define MAX_PCSTAT_VARS 8
@@ -892,6 +894,8 @@ sim_reg_options(struct opt_odb_t *odb)
   opt_reg_int(odb, "-nrp:timeout", "max NRP timer count", &nrp_max_eviction_timer_count, 16, TRUE, NULL);
   opt_reg_int(odb, "-nrp:maxstride", "max NRP prefetch stride", &nrp_max_stride, 16, TRUE, NULL);
   opt_reg_int(odb, "-nrp:rptsize", "NRP RPT size", &nrp_rpt_size, 16, TRUE, NULL);
+  opt_reg_int(odb, "-nrp:rptassoc", "NRP RPT associativity", &nrp_rpt_assoc, 1, TRUE, NULL);
+  opt_reg_int(odb, "-nrp:markovlen", "NRP Markov", &nrp_markov_len, 4, TRUE, NULL);
 }
 
 /* check simulator-specific option values */
@@ -1696,6 +1700,8 @@ struct RPT_entry {
 };
 
 struct NRP_prefetch_mode_stride_PC {
+	int sets;
+	int ways;
 	struct RPT_entry* RPT;
 };
 
@@ -1924,6 +1930,8 @@ static void nrp_prefetch_init_stride_PC(struct NRP_prefetch_mode* this) {
 	this->data = malloc(sizeof(struct NRP_prefetch_mode_stride));
 	struct NRP_prefetch_mode_stride_PC* data = this->data;
 	data->RPT = malloc(sizeof(struct RPT_entry) * nrp_rpt_size);
+	data->ways = nrp_rpt_assoc;
+	data->sets = nrp_rpt_size / nrp_rpt_assoc;
 	int i;
 	for (i = 0; i < nrp_rpt_size; ++i) {
 		data->RPT[i].state = 0;
@@ -1939,41 +1947,57 @@ static void nrp_prefetch_cleanup_stride_PC(struct NRP_prefetch_mode* this) {
 
 static void nrp_prefetch_process_stride_PC(struct NRP_prefetch_mode* this, md_addr_t PC, md_addr_t addr) {
 	struct NRP_prefetch_mode_stride_PC* data = this->data;
-	int index = PC % nrp_rpt_size;
-	if (data->RPT[index].last_pc == PC) {
-		md_addr_t pred_addr = data->RPT[index].last_load_addr + data->RPT[index].stride;
-		if (data->RPT[index].state == 0) { //initial
-			if (pred_addr == addr)
-				data->RPT[index].state = 2;
-			else
-				data->RPT[index].state = 1;
+	int set_index = (PC % data->sets) * data->ways;
+	//search for pc
+	int i;
+	for (i = 0; i < data->ways; ++i) {
+		int index = set_index + i;
+		if (data->RPT[index].last_pc == PC) {
+			md_addr_t pred_addr = data->RPT[index].last_load_addr + data->RPT[index].stride;
+			if (data->RPT[index].state == 0) { //initial
+				if (pred_addr == addr)
+					data->RPT[index].state = 2;
+				else
+					data->RPT[index].state = 1;
+			}
+			else if (data->RPT[index].state == 1) { //transient
+				if (pred_addr == addr)
+					data->RPT[index].state = 2;
+				else
+					data->RPT[index].state = 3;
+			}
+			else if (data->RPT[index].state == 2) { //steady
+				if (pred_addr == addr)
+					data->RPT[index].state = 2;
+				else
+					data->RPT[index].state = 0;
+			}
+			else { //no pred
+				if (pred_addr == addr)
+					data->RPT[index].state = 1;
+				else
+					data->RPT[index].state = 3;
+			}
+			data->RPT[index].stride = addr - data->RPT[index].last_load_addr;
+			data->RPT[index].last_load_addr = addr;
+			data->RPT[index].just_modified = 1;
 		}
-		else if (data->RPT[index].state == 1) { //transient
-			if (pred_addr == addr)
-				data->RPT[index].state = 2;
-			else
-				data->RPT[index].state = 3;
-		}
-		else if (data->RPT[index].state == 2) { //steady
-			if (pred_addr == addr)
-				data->RPT[index].state = 2;
-			else
-				data->RPT[index].state = 0;
-		}
-		else { //no pred
-			if (pred_addr == addr)
-				data->RPT[index].state = 1;
-			else
-				data->RPT[index].state = 3;
-		}
+	}
+	struct RPT_entry entry;
+	if (i < data->ways) {
+		entry = data->RPT[set_index + i];
 	}
 	else {
-		data->RPT[index].last_pc = PC;
-		data->RPT[index].state = 0;
+		entry.last_pc = PC;
+		entry.state = 0;
+		entry.stride = 1;
+		entry.last_load_addr = addr;
+		entry.just_modified = 1;
 	}
-	data->RPT[index].stride = addr - data->RPT[index].last_load_addr;
-	data->RPT[index].last_load_addr = addr;
-	data->RPT[index].just_modified = 1;
+	//shift every frame down a slot
+	for (i = i - 1; i > 0; --i)
+		data->RPT[set_index + i] = data->RPT[set_index + i - 1];
+	data->RPT[set_index] = entry;
 }
 
 static void nrp_prefetch_stride_PC(struct NRP_prefetch_mode* this) {
