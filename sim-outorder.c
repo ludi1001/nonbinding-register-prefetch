@@ -354,6 +354,9 @@ static counter_t NRP_forced_evictions;
 static counter_t NRP_timeout_evictions;
 static counter_t NRP_fetch_miss_count;
 static counter_t NRP_fetch_attempts;
+static counter_t NRP_attempt_fail_address_in_nrp;
+static counter_t NRP_attempt_fail_address_in_lsq;
+static counter_t NRP_attempt_fail_RUU_full;
 
 /* total non-speculative bogus addresses seen (debug var) */
 static counter_t sim_invalid_addrs;
@@ -1323,6 +1326,14 @@ sim_reg_stats(struct stat_sdb_t *sdb)   /* stats database */
   stat_reg_formula(sdb, "nrp_evictions", "total number of evictions", "NRP_forced_evictions + NRP_timeout_evictions", NULL);
   stat_reg_formula(sdb, "nrp_eviction_rate", "avg NRP evictions", "nrp_evictions / sim_cycle", NULL);
   stat_reg_counter(sdb, "NRP_fetch_attempts", "number of fetch attempts", &NRP_fetch_attempts, 0, NULL);
+  stat_reg_formula(sdb, "nrp_fetch_success_rate", "fetch successes / fetch attempts", "NRP_fetches / NRP_fetch_attempts", NULL);
+  stat_reg_formula(sdb, "nrp_failed_fetches", "number of failed fetches", "NRP_fetch_attempts - NRP_fetches", NULL);
+  stat_reg_counter(sdb, "NRP_attempt_fail_address_in_nrp", "failed fetches b/c already prefetched", &NRP_attempt_fail_address_in_nrp, 0, NULL);
+  stat_reg_formula(sdb, "nrp_fail_addr_in_nrp", "prop of failed prefetch b/c in NRP", "NRP_attempt_fail_address_in_nrp / nrp_failed_fetches", NULL);
+  stat_reg_counter(sdb, "NRP_attempt_fail_address_in_lsq", "failed fetches b/c in LSQ", &NRP_attempt_fail_address_in_lsq, 0, NULL);
+  stat_reg_formula(sdb, "nrp_fail_addr_in_lsq", "prop of failed prefetch b/c in LSQ", "NRP_attempt_fail_address_in_lsq / nrp_failed_fetches", NULL);
+  stat_reg_counter(sdb, "NRP_attempt_fail_RUU_full", "failed fetches b/c RUU full", &NRP_attempt_fail_RUU_full, 0, NULL);
+  stat_reg_formula(sdb, "nrp_fail_RUU_full", "prop of failed prefetch b/c RUU full", "NRP_attempt_fail_RUU_full / nrp_failed_fetches", NULL);
   stat_reg_counter(sdb, "NRP_fetch_miss_count", "number of prefetch attempts to data not in L1", &NRP_fetch_miss_count, 0, NULL);
   stat_reg_formula(sdb, "nrp_fetch_miss_prop", "proportion of prefetch attempts that miss in L1", "NRP_fetch_miss_count / NRP_fetch_attempts", NULL);
 
@@ -1705,11 +1716,23 @@ struct NRP_prefetch_mode_stride_PC {
 	struct RPT_entry* RPT;
 };
 
+struct Markov_entry {
+	md_addr_t* next;
+};
+
+struct NRP_prefetch_mode_markov {
+	int num_sets;
+	int num_ways;
+	int num_successors;
+	struct Markov_entry* entries;
+};
+
 enum {
 	NO_PREFETCH,
 	STREAM_PREFETCH,
 	STRIDE_PREFETCH,
 	STRIDE_PREFETCH_PC,
+	MARKOV_PREFETCH,
 	NUM_PREFETCH
 };
 
@@ -1761,6 +1784,22 @@ static int nrp_address_prefetched(md_addr_t addr) {
 			return 1;
 		}
 		node = node->next;
+	}
+	return 0;
+}
+
+/* determine whether an address is in the lsq */
+static int lsq_address_exists(md_addr_t addr) {
+	int num = LSQ_num;
+	int head = LSQ_head;
+	struct RUU_station* rs;
+	while (num)
+	{
+		rs = &LSQ[head];
+		if (rs->addr == addr)
+			return 1;
+		head = (head + 1) % LSQ_size;
+		num--;
 	}
 	return 0;
 }
@@ -1818,14 +1857,23 @@ static int nrp_insert(md_addr_t addr) {
 	if (nrp_mode == 0)
 		return 0;
 
-	if (nrp_address_prefetched(addr))
-		return 0;
-
 	NRP_fetch_attempts++;
 
-	/* is RUU full? */
-	if (NRP_num + RUU_num == RUU_size)
+	if (nrp_address_prefetched(addr)) {
+		NRP_attempt_fail_address_in_nrp++;
 		return 0;
+	}
+
+	if (lsq_address_exists(addr)) {
+		NRP_attempt_fail_address_in_lsq++;
+		return 0;
+	}
+
+	/* is RUU full? */
+	if (NRP_num + RUU_num == RUU_size) {
+		NRP_attempt_fail_RUU_full++;
+		return 0;
+	}
 
 	//make sure in L1 cache
 	/*if (!cache_probe(cache_dl1, addr)) {
@@ -2011,6 +2059,33 @@ static void nrp_prefetch_stride_PC(struct NRP_prefetch_mode* this) {
 	}
 }
 
+/* markov prefetching */
+static void nrp_prefetch_init_markov(struct NRP_prefetch_mode* this) {
+	this->data = malloc(sizeof(struct NRP_prefetch_mode_markov));
+	struct NRP_prefetch_mode_markov* data = this->data;
+	data->entries = malloc(sizeof(struct Markov_entry) * nrp_rpt_size);
+	data->num_ways = nrp_rpt_assoc;
+	data->num_sets = nrp_rpt_size / nrp_rpt_assoc;
+	data->num_successors = nrp_markov_len;
+	int i = 0;
+	for (i = 0; i < nrp_rpt_size; ++i)
+		data->entries[i].next = malloc(sizeof(md_addr_t) * data->num_successors);
+}
+
+static void nrp_prefetch_cleanup_markov(struct NRP_prefetch_mode* this) {
+	struct NRP_prefetch_mode_markov* data = this->data;
+	int i = 0;
+	for (i = 0; i < nrp_rpt_size; ++i)
+		free(data->entries[i].next);
+	free(data->entries);
+	free(this->data);
+}
+
+static void nrp_prefetch_process_markov(struct NRP_prefetch_mode* this, md_addr_t PC, md_addr_t addr) {
+	struct NRP_prefetch_mode_markov* data = this->data;
+	int set_index = (PC % data->num_sets) * data->num_ways;
+
+}
 
 static void nrp_init() {
 	NRP_list = (struct NRP_station*)malloc(sizeof(struct NRP_station));
