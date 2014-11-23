@@ -886,7 +886,7 @@ sim_reg_options(struct opt_odb_t *odb)
 	       "operate in backward-compatible bugs mode (for testing only)",
 	       &bugcompat_mode, /* default */FALSE, /* print */TRUE, NULL);
 
-  opt_reg_flag(odb, "-nrp:mode", "nonbinding register prefetch mode", &nrp_mode, 0, TRUE, NULL);
+  opt_reg_int(odb, "-nrp:mode", "nonbinding register prefetch mode", &nrp_mode, 0, TRUE, NULL);
   opt_reg_int(odb, "-nrp:timeout", "max NRP timer count", &nrp_max_eviction_timer_count, 16, TRUE, NULL);
 }
 
@@ -1669,36 +1669,30 @@ struct NRP_station {
 	struct NRP_station* prev;
 };
 
+struct NRP_prefetch_mode {
+	void(*init)(struct NRP_prefetch_mode*);
+	void(*cleanup)(struct NRP_prefetch_mode*);
+	void(*process_prefetch)(struct NRP_prefetch_mode*, md_addr_t);
+	void(*do_prefetch)(struct NRP_prefetch_mode*);
+	void* data;
+};
+
+enum {
+	NO_PREFETCH,
+	STREAM_PREFETCH,
+	STRIDE_PREFETCH,
+	NUM_PREFETCH
+};
+
 static int NRP_num = 0; //number of RUU stations used as NRP station
 static int nrp_global_eviction_timer = 0; //eviction timer
 static struct NRP_station* NRP_list = NULL;
-static md_addr_t prefetch_address = 0;
+static struct NRP_prefetch_mode nrp_prefetch_arr[NUM_PREFETCH];
 
-static void nrp_init() {
-	NRP_list = (struct NRP_station*)malloc(sizeof(struct NRP_station));
-	NRP_list->busy = -1;
-	NRP_list->next = NRP_list;
-	NRP_list->prev = NRP_list;
-	NRP_list->eviction_time = -1;
-
-	NRP_hits = NRP_fetches = NRP_count = NRP_forced_evictions = NRP_timeout_evictions = NRP_latency = 0;
-}
-
-static void nrp_cleanup() {
-	struct NRP_station* node = NRP_list->next;
-	while (node != NRP_list) {
-		struct NRP_station* nnode = node->next;
-		free(node);
-		node = nnode;
-	}
-	free(NRP_list);
-	NRP_list = NULL;
-	NRP_num = 0;
-}
 
 /* attempts to fetch data from nrp
- * returns latency of access or -1 if not in NRP
- */
+* returns latency of access or -1 if not in NRP
+*/
 static int nrp_address_fetch(md_addr_t addr) {
 	if (nrp_mode == 0)
 		return -1;
@@ -1788,9 +1782,6 @@ static void nrp_update() {
 		node = node->next;
 	}
 
-
-
-
 }
 
 /* insert address in NRP */
@@ -1831,31 +1822,105 @@ static int nrp_insert(md_addr_t addr) {
 	return 0;
 }
 
-/* issues prefetching operations */
-static void nrp_prefetch() {
-	if (nrp_mode == 0)
-		return;
 
-	if (prefetch_address == 0)
+/* stream prefetching */
+static void nrp_prefetch_init_stream(struct NRP_prefetch_mode* this) {
+	this->data = malloc(sizeof(md_addr_t));
+}
+
+static void nrp_prefetch_cleanup_stream(struct NRP_prefetch_mode* this) {
+	free(this->data);
+}
+
+static void nrp_prefetch_process_stream(struct NRP_prefetch_mode* this, md_addr_t addr) {
+	md_addr_t* prefetch_address = this->data;
+	md_addr_t new_addr = addr + 1;
+	if (!nrp_address_prefetched(new_addr))
+		*prefetch_address = new_addr;
+}
+
+static void nrp_prefetch_stream(struct NRP_prefetch_mode* this) {
+	md_addr_t* prefetch_address = this->data;
+	if (*prefetch_address == 0)
 		return;
 
 	//perform prefetch
-	md_addr_t addr = prefetch_address;
+	md_addr_t addr = *prefetch_address;
 
 	do {
 		while (nrp_address_prefetched(addr))
 			addr = addr + 1;
 	} while (nrp_insert(addr));
-	prefetch_address = addr;
+	*prefetch_address = addr;
 }
+
+/* stride prefetching */
+/*
+static void nrp_prefetch_process_stride(struct NRP_prefetch_mode* this, md_addr_t addr) {
+	md_addr_t* last_load_addr = addr;
+	int stride = addr - last_load_addr;
+	md_addr_t new_addr = addr + stride;
+	if (!nrp_address_prefetched(new_addr))
+		prefetch_address = new_addr;
+	last_load_addr = addr;
+}*/
+
+static void nrp_init() {
+	NRP_list = (struct NRP_station*)malloc(sizeof(struct NRP_station));
+	NRP_list->busy = -1;
+	NRP_list->next = NRP_list;
+	NRP_list->prev = NRP_list;
+	NRP_list->eviction_time = -1;
+
+	NRP_hits = NRP_fetches = NRP_count = NRP_forced_evictions = NRP_timeout_evictions = NRP_latency = 0;
+
+	//setup prefetch modes
+	nrp_prefetch_arr[NO_PREFETCH].init = NULL;
+	nrp_prefetch_arr[NO_PREFETCH].cleanup = NULL;
+	nrp_prefetch_arr[NO_PREFETCH].process_prefetch = NULL;
+	nrp_prefetch_arr[NO_PREFETCH].do_prefetch = NULL;
+
+#define DEFINE_PREFETCH_MODE(index, name) { \
+	nrp_prefetch_arr[index].init = nrp_prefetch_init_##name; \
+	nrp_prefetch_arr[index].cleanup = nrp_prefetch_cleanup_##name; \
+	nrp_prefetch_arr[STREAM_PREFETCH].process_prefetch = nrp_prefetch_process_##name; \
+	nrp_prefetch_arr[STREAM_PREFETCH].do_prefetch = nrp_prefetch_##name; \
+	}
+
+	DEFINE_PREFETCH_MODE(STREAM_PREFETCH, stream);
+
+#undef DEFINE_PREFETCH_MODE
+
+	if (nrp_prefetch_arr[nrp_mode].init)
+		nrp_prefetch_arr[nrp_mode].init(&nrp_prefetch_arr[nrp_mode]);
+}
+
+static void nrp_cleanup() {
+	struct NRP_station* node = NRP_list->next;
+	while (node != NRP_list) {
+		struct NRP_station* nnode = node->next;
+		free(node);
+		node = nnode;
+	}
+	free(NRP_list);
+	NRP_list = NULL;
+	NRP_num = 0;
+
+	if (nrp_prefetch_arr[nrp_mode].cleanup)
+		nrp_prefetch_arr[nrp_mode].cleanup(&nrp_prefetch_arr[nrp_mode]);
+}
+
+/* issues prefetching operations */
+static void nrp_prefetch() {
+	if (nrp_prefetch_arr[nrp_mode].do_prefetch)
+		nrp_prefetch_arr[nrp_mode].do_prefetch(&nrp_prefetch_arr[nrp_mode]);
+}
+
 
 /* collects data for prefetching purposes */
 static void nrp_prefetch_process(md_addr_t addr) {
-	if (nrp_mode == 0)
-		return;
-
-	if (!nrp_address_prefetched(addr + 1))
-		prefetch_address = addr + 1;
+	if (nrp_prefetch_arr[nrp_mode].process_prefetch)
+		nrp_prefetch_arr[nrp_mode].process_prefetch(&nrp_prefetch_arr[nrp_mode], addr);
 }
 
 /*
