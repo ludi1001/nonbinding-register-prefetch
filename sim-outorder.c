@@ -222,6 +222,8 @@ static int res_fpmult;
 /* NRP mode */
 static int nrp_mode;
 static int nrp_max_eviction_timer_count;
+static int nrp_max_stride;
+static int nrp_rpt_size;
 
 /* text-based stat profiles */
 #define MAX_PCSTAT_VARS 8
@@ -888,6 +890,8 @@ sim_reg_options(struct opt_odb_t *odb)
 
   opt_reg_int(odb, "-nrp:mode", "nonbinding register prefetch mode", &nrp_mode, 0, TRUE, NULL);
   opt_reg_int(odb, "-nrp:timeout", "max NRP timer count", &nrp_max_eviction_timer_count, 16, TRUE, NULL);
+  opt_reg_int(odb, "-nrp:maxstride", "max NRP prefetch stride", &nrp_max_stride, 16, TRUE, NULL);
+  opt_reg_int(odb, "-nrp:rptsize", "NRP RPT size", &nrp_rpt_size, 16, TRUE, NULL);
 }
 
 /* check simulator-specific option values */
@@ -1683,9 +1687,17 @@ struct NRP_prefetch_mode_stride {
 	int stride;
 };
 
-struct NRP_prefetch_mode_stride_PC {
-
+struct RPT_entry {
+	md_addr_t last_pc;
+	md_addr_t last_load_addr;
+	int stride;
+	int state;
 };
+
+struct NRP_prefetch_mode_stride_PC {
+	struct RPT_entry* RPT;
+};
+
 enum {
 	NO_PREFETCH,
 	STREAM_PREFETCH,
@@ -1806,10 +1818,10 @@ static int nrp_insert(md_addr_t addr) {
 		return 0;
 
 	//make sure in L1 cache
-	if (!cache_probe(cache_dl1, addr)) {
+	/*if (!cache_probe(cache_dl1, addr)) {
 		NRP_fetch_miss_count++;
 		return 0;
-	}
+	}*/
 
 	struct res_template* fu = res_get(fu_pool, RdPort);
 	if (fu) {
@@ -1879,7 +1891,7 @@ static void nrp_prefetch_cleanup_stride(struct NRP_prefetch_mode* this) {
 static void nrp_prefetch_process_stride(struct NRP_prefetch_mode* this, md_addr_t PC, md_addr_t addr) {
 	struct NRP_prefetch_mode_stride* data = this->data;
 	int stride = addr - data->last_load_address;
-	if (stride > 32)
+	if (stride > nrp_max_stride)
 		stride = 1;
 	md_addr_t new_addr = addr + stride;
 	if (!nrp_address_prefetched(new_addr))
@@ -1901,6 +1913,27 @@ static void nrp_prefetch_stride(struct NRP_prefetch_mode* this) {
 			nrp_insert(addr);
 	}
 	data->prefetch_address += res_memport * data->stride;
+}
+
+/* baer chen RPT stride prefetching */
+static void nrp_prefetch_init_stride_PC(struct NRP_prefetch_mode* this) {
+	this->data = malloc(sizeof(struct NRP_prefetch_mode_stride));
+	struct NRP_prefetch_mode_stride_PC* data = this->data;
+	data->RPT = malloc(sizeof(struct RPT_entry) * nrp_rpt_size);
+}
+
+static void nrp_prefetch_cleanup_stride_PC(struct NRP_prefetch_mode* this) {
+	struct NRP_prefetch_mode_stride_PC* data = this->data;
+	free(data->RPT);
+	free(this->data);
+}
+
+static void nrp_prefetch_process_stride_PC(struct NRP_prefetch_mode* this, md_addr_t PC, md_addr_t addr) {
+	struct NRP_prefetch_mode_stride_PC* data = this->data;
+	int index = PC % nrp_rpt_size;
+	if (data->RPT[index].last_pc == PC) {
+
+	}
 }
 
 
