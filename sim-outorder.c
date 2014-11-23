@@ -1683,10 +1683,14 @@ struct NRP_prefetch_mode_stride {
 	int stride;
 };
 
+struct NRP_prefetch_mode_stride_PC {
+
+};
 enum {
 	NO_PREFETCH,
 	STREAM_PREFETCH,
 	STRIDE_PREFETCH,
+	STRIDE_PREFETCH_PC,
 	NUM_PREFETCH
 };
 
@@ -1918,12 +1922,12 @@ static void nrp_init() {
 #define DEFINE_PREFETCH_MODE(index, name) { \
 	nrp_prefetch_arr[index].init = nrp_prefetch_init_##name; \
 	nrp_prefetch_arr[index].cleanup = nrp_prefetch_cleanup_##name; \
-	nrp_prefetch_arr[STREAM_PREFETCH].process_prefetch = nrp_prefetch_process_##name; \
-	nrp_prefetch_arr[STREAM_PREFETCH].do_prefetch = nrp_prefetch_##name; \
+	nrp_prefetch_arr[index].process_prefetch = nrp_prefetch_process_##name; \
+	nrp_prefetch_arr[index].do_prefetch = nrp_prefetch_##name; \
 	}
 
 	DEFINE_PREFETCH_MODE(STREAM_PREFETCH, stream);
-	DEFINE_PREFETCH_MODE(STREAM_PREFETCH, stride);
+	DEFINE_PREFETCH_MODE(STRIDE_PREFETCH, stride);
 
 #undef DEFINE_PREFETCH_MODE
 
