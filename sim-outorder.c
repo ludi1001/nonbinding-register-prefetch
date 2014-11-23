@@ -1940,30 +1940,36 @@ static void nrp_prefetch_cleanup_stride_PC(struct NRP_prefetch_mode* this) {
 static void nrp_prefetch_process_stride_PC(struct NRP_prefetch_mode* this, md_addr_t PC, md_addr_t addr) {
 	struct NRP_prefetch_mode_stride_PC* data = this->data;
 	int index = PC % nrp_rpt_size;
-	md_addr_t pred_addr = data->RPT[index].last_load_addr + data->RPT[index].stride;
-	if (data->RPT[index].state == 0) { //initial
-		if (pred_addr == addr)
-			data->RPT[index].state = 2;
-		else
-			data->RPT[index].state = 1;
+	if (data->RPT[index].last_pc == PC) {
+		md_addr_t pred_addr = data->RPT[index].last_load_addr + data->RPT[index].stride;
+		if (data->RPT[index].state == 0) { //initial
+			if (pred_addr == addr)
+				data->RPT[index].state = 2;
+			else
+				data->RPT[index].state = 1;
+		}
+		else if (data->RPT[index].state == 1) { //transient
+			if (pred_addr == addr)
+				data->RPT[index].state = 2;
+			else
+				data->RPT[index].state = 3;
+		}
+		else if (data->RPT[index].state == 2) { //steady
+			if (pred_addr == addr)
+				data->RPT[index].state = 2;
+			else
+				data->RPT[index].state = 0;
+		}
+		else { //no pred
+			if (pred_addr == addr)
+				data->RPT[index].state = 1;
+			else
+				data->RPT[index].state = 3;
+		}
 	}
-	else if (data->RPT[index].state == 1) { //transient
-		if (pred_addr == addr) 
-			data->RPT[index].state = 2;
-		else
-			data->RPT[index].state = 3;
-	}
-	else if (data->RPT[index].state == 2) { //steady
-		if (pred_addr == addr) 
-			data->RPT[index].state = 2;
-		else
-			data->RPT[index].state = 0;
-	}
-	else { //no pred
-		if (pred_addr == addr) 
-			data->RPT[index].state = 1;
-		else
-			data->RPT[index].state = 3;
+	else {
+		data->RPT[index].last_pc = PC;
+		data->RPT[index].state = 0;
 	}
 	data->RPT[index].stride = addr - data->RPT[index].last_load_addr;
 	data->RPT[index].last_load_addr = addr;
@@ -1974,7 +1980,7 @@ static void nrp_prefetch_stride_PC(struct NRP_prefetch_mode* this) {
 	struct NRP_prefetch_mode_stride_PC* data = this->data;
 	int i = 0;
 	for (i = 0; i < nrp_rpt_size; ++i) {
-		if (data->RPT[i].just_modified) {
+		if (data->RPT[i].just_modified && data->RPT[i].state == 2) {
 			nrp_insert(data->RPT[i].last_load_addr + data->RPT[i].stride);
 		}
 		data->RPT[i].just_modified = 0;
