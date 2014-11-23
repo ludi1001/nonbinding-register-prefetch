@@ -1692,6 +1692,7 @@ struct RPT_entry {
 	md_addr_t last_load_addr;
 	int stride;
 	int state;
+	int just_modified;
 };
 
 struct NRP_prefetch_mode_stride_PC {
@@ -1811,6 +1812,9 @@ static int nrp_insert(md_addr_t addr) {
 	if (nrp_mode == 0)
 		return 0;
 
+	if (nrp_address_prefetched(addr))
+		return 0;
+
 	NRP_fetch_attempts++;
 
 	/* is RUU full? */
@@ -1920,6 +1924,11 @@ static void nrp_prefetch_init_stride_PC(struct NRP_prefetch_mode* this) {
 	this->data = malloc(sizeof(struct NRP_prefetch_mode_stride));
 	struct NRP_prefetch_mode_stride_PC* data = this->data;
 	data->RPT = malloc(sizeof(struct RPT_entry) * nrp_rpt_size);
+	int i;
+	for (i = 0; i < nrp_rpt_size; ++i) {
+		data->RPT[i].state = 0;
+		data->RPT[i].just_modified = 0;
+	}
 }
 
 static void nrp_prefetch_cleanup_stride_PC(struct NRP_prefetch_mode* this) {
@@ -1931,8 +1940,44 @@ static void nrp_prefetch_cleanup_stride_PC(struct NRP_prefetch_mode* this) {
 static void nrp_prefetch_process_stride_PC(struct NRP_prefetch_mode* this, md_addr_t PC, md_addr_t addr) {
 	struct NRP_prefetch_mode_stride_PC* data = this->data;
 	int index = PC % nrp_rpt_size;
-	if (data->RPT[index].last_pc == PC) {
+	md_addr_t pred_addr = data->RPT[index].last_load_addr + data->RPT[index].stride;
+	if (data->RPT[index].state == 0) { //initial
+		if (pred_addr == addr)
+			data->RPT[index].state = 2;
+		else
+			data->RPT[index].state = 1;
+	}
+	else if (data->RPT[index].state == 1) { //transient
+		if (pred_addr == addr) 
+			data->RPT[index].state = 2;
+		else
+			data->RPT[index].state = 3;
+	}
+	else if (data->RPT[index].state == 2) { //steady
+		if (pred_addr == addr) 
+			data->RPT[index].state = 2;
+		else
+			data->RPT[index].state = 0;
+	}
+	else { //no pred
+		if (pred_addr == addr) 
+			data->RPT[index].state = 1;
+		else
+			data->RPT[index].state = 3;
+	}
+	data->RPT[index].stride = addr - data->RPT[index].last_load_addr;
+	data->RPT[index].last_load_addr = addr;
+	data->RPT[index].just_modified = 1;
+}
 
+static void nrp_prefetch_stride_PC(struct NRP_prefetch_mode* this) {
+	struct NRP_prefetch_mode_stride_PC* data = this->data;
+	int i = 0;
+	for (i = 0; i < nrp_rpt_size; ++i) {
+		if (data->RPT[i].just_modified) {
+			nrp_insert(data->RPT[i].last_load_addr + data->RPT[i].stride);
+		}
+		data->RPT[i].just_modified = 0;
 	}
 }
 
@@ -1961,6 +2006,7 @@ static void nrp_init() {
 
 	DEFINE_PREFETCH_MODE(STREAM_PREFETCH, stream);
 	DEFINE_PREFETCH_MODE(STRIDE_PREFETCH, stride);
+	DEFINE_PREFETCH_MODE(STRIDE_PREFETCH_PC, stride_PC);
 
 #undef DEFINE_PREFETCH_MODE
 
