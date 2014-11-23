@@ -1672,9 +1672,15 @@ struct NRP_station {
 struct NRP_prefetch_mode {
 	void(*init)(struct NRP_prefetch_mode*);
 	void(*cleanup)(struct NRP_prefetch_mode*);
-	void(*process_prefetch)(struct NRP_prefetch_mode*, md_addr_t);
+	void(*process_prefetch)(struct NRP_prefetch_mode*, md_addr_t, md_addr_t);
 	void(*do_prefetch)(struct NRP_prefetch_mode*);
 	void* data;
+};
+
+struct NRP_prefetch_mode_stride {
+	md_addr_t last_load_address;
+	md_addr_t prefetch_address;
+	int stride;
 };
 
 enum {
@@ -1831,7 +1837,7 @@ static void nrp_prefetch_cleanup_stream(struct NRP_prefetch_mode* this) {
 	free(this->data);
 }
 
-static void nrp_prefetch_process_stream(struct NRP_prefetch_mode* this, md_addr_t addr) {
+static void nrp_prefetch_process_stream(struct NRP_prefetch_mode* this, md_addr_t PC, md_addr_t addr) {
 	md_addr_t* prefetch_address = this->data;
 	md_addr_t new_addr = addr + 1;
 	if (!nrp_address_prefetched(new_addr))
@@ -1844,45 +1850,53 @@ static void nrp_prefetch_stream(struct NRP_prefetch_mode* this) {
 		return;
 
 	//perform prefetch
-	md_addr_t addr = *prefetch_address;
-	if (nrp_insert(addr))
-		addr = addr + 1;
-	*prefetch_address = addr;
+	int i = 0;
+	for (i = 0; i < res_memport; ++i) {
+		md_addr_t addr = *prefetch_address + i;
+		if (!nrp_address_prefetched(addr))
+			nrp_insert(addr);
+	}
+	*prefetch_address += res_memport;
 }
 
 /* stride prefetching */
 static void nrp_prefetch_init_stride(struct NRP_prefetch_mode* this) {
-	this->data = malloc(sizeof(md_addr_t)*2);
-	md_addr_t* data = this->data;
-	data[0] = data[1] = 1;
+	this->data = malloc(sizeof(struct NRP_prefetch_mode_stride));
+	struct NRP_prefetch_mode_stride* data = this->data;
+	data->last_load_address = 0;
+	data->stride = 0;
+	data->prefetch_address = 0;
 }
 
 static void nrp_prefetch_cleanup_stride(struct NRP_prefetch_mode* this) {
 	free(this->data);
 }
 
-static void nrp_prefetch_process_stride(struct NRP_prefetch_mode* this, md_addr_t addr) {
-	md_addr_t* data = this->data;
-	md_addr_t* prefetch_address = data;
-	md_addr_t* stride = data + 1;
-	md_addr_t new_addr = addr + *stride;
+static void nrp_prefetch_process_stride(struct NRP_prefetch_mode* this, md_addr_t PC, md_addr_t addr) {
+	struct NRP_prefetch_mode_stride* data = this->data;
+	int stride = addr - data->last_load_address;
+	if (stride > 32)
+		stride = 1;
+	md_addr_t new_addr = addr + stride;
 	if (!nrp_address_prefetched(new_addr))
-		*prefetch_address = new_addr;
+		data->prefetch_address = new_addr;
+	data->last_load_address = addr;
 }
 
 static void nrp_prefetch_stride(struct NRP_prefetch_mode* this) {
-	md_addr_t* prefetch_address = this->data;
-	if (*prefetch_address == 0)
+	struct NRP_prefetch_mode_stride* data = this->data;
+
+	if (data->prefetch_address == 0)
 		return;
 
 	//perform prefetch
-	md_addr_t addr = *prefetch_address;
-
-	do {
-		while (nrp_address_prefetched(addr))
-			addr = addr + 1;
-	} while (nrp_insert(addr));
-	*prefetch_address = addr;
+	int i = 0;
+	for (i = 0; i < res_memport; ++i) {
+		md_addr_t addr = data->prefetch_address + i * data->stride;
+		if (!nrp_address_prefetched(addr))
+			nrp_insert(addr);
+	}
+	data->prefetch_address += res_memport * data->stride;
 }
 
 
@@ -1940,9 +1954,9 @@ static void nrp_prefetch() {
 
 
 /* collects data for prefetching purposes */
-static void nrp_prefetch_process(md_addr_t addr) {
+static void nrp_prefetch_process(md_addr_t PC, md_addr_t addr) {
 	if (nrp_prefetch_arr[nrp_mode].process_prefetch)
-		nrp_prefetch_arr[nrp_mode].process_prefetch(&nrp_prefetch_arr[nrp_mode], addr);
+		nrp_prefetch_arr[nrp_mode].process_prefetch(&nrp_prefetch_arr[nrp_mode], PC, addr);
 }
 
 /*
@@ -4308,7 +4322,7 @@ ruu_dispatch(void)
 
 		  /* process prefetch */
 		  if (MD_OP_FLAGS(op) & F_LOAD) {
-			  nrp_prefetch_process(addr);
+			  nrp_prefetch_process(regs.regs_PC, addr);
 		  }
 
 	      /* pipetrace this uop */
