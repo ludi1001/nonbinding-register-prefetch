@@ -226,6 +226,7 @@ static int nrp_max_stride;
 static int nrp_rpt_size;
 static int nrp_rpt_assoc;
 static int nrp_markov_len;
+static int nrp_ghb_size;
 
 /* text-based stat profiles */
 #define MAX_PCSTAT_VARS 8
@@ -899,6 +900,7 @@ sim_reg_options(struct opt_odb_t *odb)
   opt_reg_int(odb, "-nrp:rptsize", "NRP RPT size", &nrp_rpt_size, 16, TRUE, NULL);
   opt_reg_int(odb, "-nrp:rptassoc", "NRP RPT associativity", &nrp_rpt_assoc, 1, TRUE, NULL);
   opt_reg_int(odb, "-nrp:markovlen", "NRP Markov", &nrp_markov_len, 4, TRUE, NULL);
+  opt_reg_int(odb, "-nrp:ghbsize", "GHB size", &nrp_ghb_size, 16, TRUE, NULL);
 }
 
 /* check simulator-specific option values */
@@ -1666,26 +1668,73 @@ ruu_dump(FILE *stream)				/* output stream */
     }
 }
 
-/* Nonbinding register prefetch unit (NRP): prefetches values into the RUU if there are empty RUU entries
- * prefetches are made when:
- *    1) An empty RUU entry exists
- *    2) There is at least one available load port
+
+
+/*
+ * load/store queue (LSQ): holds loads and stores in program order, indicating
+ * status of load/store access:
  *
- * prefetch value entries are evicted when:
- *    1) A RUU entry is required by proper operation
- *    2) The RUU entry is too old (dependent on eviction policy)
+ *   - issued: address computation complete, memory access in progress
+ *   - completed: memory access has completed, stored value available
+ *   - squashed: memory access was squashed, ignore this entry
  *
- * Note that for simulation purposes the NRP data structure is separate from the RUU structure 
- * but in actual implementation, they need not be separate. NRP linked lists is a circular linked list that starts and ends
- * with a dummy node;
+ * loads may execute when:
+ *   1) register operands are ready, and
+ *   2) memory operands are ready (no earlier unresolved store)
+ *
+ * loads are serviced by:
+ *   1) previous store at same address in LSQ (hit latency), or
+ *   2) data cache (hit latency + miss latency)
+ *
+ * stores may execute when:
+ *   1) register operands are ready
+ *
+ * stores are serviced by:
+ *   1) depositing store value into the load/store queue
+ *   2) writing store value to the store buffer (plus tag check) at commit
+ *   3) writing store buffer entry to data cache when cache is free
+ *
+ * NOTE: the load/store queue can bypass a store value to a load in the same
+ *   cycle the store executes (using a bypass network), thus stores complete
+ *   in effective zero time after their effective address is known
  */
+static struct RUU_station *LSQ;         /* load/store queue */
+static int LSQ_head, LSQ_tail;          /* LSQ head and tail pointers */
+static int LSQ_num;                     /* num entries currently in LSQ */
+
+
+/* Nonbinding register prefetch unit (NRP): prefetches values into the RUU if there are empty RUU entries
+* prefetches are made when:
+*    1) An empty RUU entry exists
+*    2) There is at least one available load port
+*
+* prefetch value entries are evicted when:
+*    1) A RUU entry is required by proper operation
+*    2) The RUU entry is too old (dependent on eviction policy)
+*
+* Note that for simulation purposes the NRP data structure is separate from the RUU structure
+* but in actual implementation, they need not be separate. NRP linked lists is a circular linked list that starts and ends
+* with a dummy node;
+*/
 
 struct NRP_station {
 	md_addr_t addr; //address from which the value was prefetched
 	int busy; //counts cycles until value is ready (0 = ready)
-	int eviction_time; 
+	int eviction_time;
 	struct NRP_station* next;
 	struct NRP_station* prev;
+};
+
+struct GHB_entry {
+	md_addr_t pc;
+	md_addr_t addr;
+	int just_modified;
+};
+
+struct GHB {
+	int tail;
+	int size;
+	struct GHB_entry* buffer;
 };
 
 struct NRP_prefetch_mode {
@@ -1717,6 +1766,7 @@ struct NRP_prefetch_mode_stride_PC {
 };
 
 struct Markov_entry {
+	md_addr_t addr;
 	md_addr_t* next;
 };
 
@@ -1724,8 +1774,10 @@ struct NRP_prefetch_mode_markov {
 	int num_sets;
 	int num_ways;
 	int num_successors;
+	struct GHB ghb;
 	struct Markov_entry* entries;
 };
+
 
 enum {
 	NO_PREFETCH,
@@ -1740,7 +1792,6 @@ static int NRP_num = 0; //number of RUU stations used as NRP station
 static int nrp_global_eviction_timer = 0; //eviction timer
 static struct NRP_station* NRP_list = NULL;
 static struct NRP_prefetch_mode nrp_prefetch_arr[NUM_PREFETCH];
-
 
 /* attempts to fetch data from nrp
 * returns latency of access or -1 if not in NRP
@@ -1877,8 +1928,8 @@ static int nrp_insert(md_addr_t addr) {
 
 	//make sure in L1 cache
 	/*if (!cache_probe(cache_dl1, addr)) {
-		NRP_fetch_miss_count++;
-		return 0;
+	NRP_fetch_miss_count++;
+	return 0;
 	}*/
 
 	struct res_template* fu = res_get(fu_pool, RdPort);
@@ -1900,6 +1951,34 @@ static int nrp_insert(md_addr_t addr) {
 		return 1;
 	}
 	return 0;
+}
+
+/* manage GHB */
+static void ghb_init(struct GHB* ghb) {
+	ghb->size = nrp_ghb_size;
+	ghb->tail = 0;
+	ghb->buffer = malloc(sizeof(struct GHB_entry) * nrp_ghb_size);
+	memset(ghb->buffer, 0, sizeof(struct GHB_entry) * nrp_ghb_size);
+}
+
+static void ghb_cleanup(struct GHB* ghb) {
+	free(ghb->buffer);
+}
+
+static void ghb_insert(struct GHB* ghb, md_addr_t pc, md_addr_t addr) {
+	ghb->buffer[ghb->tail].pc = pc;
+	ghb->buffer[ghb->tail].addr = addr;
+	ghb->buffer[ghb->tail].just_modified = 1;
+
+	ghb->tail = (ghb->tail + 1) % ghb->size;
+}
+
+static struct GHB_entry* ghb_fetch(struct GHB* ghb, int n) {
+	//fetch the nth one from the tail
+	int index = ghb->tail - n;
+	if (index < 0)
+		index += ghb->size;
+	return &ghb->buffer[index];
 }
 
 /* stream prefetching */
@@ -2069,7 +2148,9 @@ static void nrp_prefetch_init_markov(struct NRP_prefetch_mode* this) {
 	data->num_successors = nrp_markov_len;
 	int i = 0;
 	for (i = 0; i < nrp_rpt_size; ++i)
-		data->entries[i].next = malloc(sizeof(md_addr_t) * data->num_successors);
+		data->entries[i].next = malloc(sizeof(md_addr_t)* data->num_successors);
+
+	ghb_init(&data->ghb);
 }
 
 static void nrp_prefetch_cleanup_markov(struct NRP_prefetch_mode* this) {
@@ -2078,13 +2159,114 @@ static void nrp_prefetch_cleanup_markov(struct NRP_prefetch_mode* this) {
 	for (i = 0; i < nrp_rpt_size; ++i)
 		free(data->entries[i].next);
 	free(data->entries);
+	ghb_cleanup(&data->ghb);
 	free(this->data);
 }
 
 static void nrp_prefetch_process_markov(struct NRP_prefetch_mode* this, md_addr_t PC, md_addr_t addr) {
 	struct NRP_prefetch_mode_markov* data = this->data;
-	int set_index = (PC % data->num_sets) * data->num_ways;
+	struct GHB_entry* ghb_entry = ghb_fetch(&data->ghb, 1);
+	int set_index = (ghb_entry->addr % data->num_sets) * data->num_ways;
+	int i;
+	int index;
+	//search for entry
+	for (i = 0; i < data->num_ways; ++i) {
+		index = set_index + i;
+		if (data->entries[index].addr == ghb_entry->addr) {
+			int j;
+			//search for address
+			for (j = 0; j < data->num_successors; ++j) {
+				if (data->entries[index].next[j] == addr)
+					break;
+			}
+			//shuffle
+			int k;
+			for (k = j; k > 0; --k)
+				data->entries[index].next[k] = data->entries[index].next[k - 1];
+			data->entries[0].addr = addr;
+			break;
+		}
+	}
 
+	//save entry if found
+	int found = 0;
+	struct Markov_entry entry;
+	if (i != data->num_ways) {
+		entry.next = malloc(sizeof(md_addr_t)* data->num_successors);
+		entry.addr = data->entries[set_index + i].addr;
+		int k;
+		for (k = 0; i < data->num_successors; ++k)
+			entry.next[k] = data->entries[set_index + i].next[k];
+		found = 1;
+	}
+
+	//shuffle
+	int k;
+	for (k = i; k > 0; --k) {
+		int index = set_index + k;
+		data->entries[index].addr = data->entries[index - 1].addr;
+		int m;
+		for (m = 0; m < data->num_successors; ++m)
+			data->entries[index].next[m] = data->entries[index - 1].next[m];
+	}
+
+	//copy data back if found
+	if (found) {
+		data->entries[index].addr = entry.addr;
+		for (k = 0; k < data->num_successors; ++k)
+			data->entries[index].next[k] = entry.next[k];
+	}
+	else {
+		data->entries[set_index].addr = ghb_entry->addr;
+		data->entries[set_index].next[0] = addr;
+	}
+
+	//deal with ghb
+	ghb_insert(&data->ghb, PC, addr);
+}
+
+static void nrp_prefetch_markov(struct NRP_prefetch_mode* this) {
+	struct NRP_prefetch_mode_markov* data = this->data;
+
+	int loads = 0; //number of entries to look back
+	int i = 0; //generic counter
+	struct GHB_entry* ghb_entry = ghb_fetch(&data->ghb, i + 1);
+	while (ghb_entry->just_modified == 1)
+		++i;
+	loads = i;
+
+	//calculate number of attempts: either limited by memports or by number of loads
+	int attempts = res_memport;
+	if (attempts > loads * data->num_successors)
+		attempts = loads * data->num_successors;
+    i = 0;
+	int k = 0;
+	while (attempts > 0) {
+		ghb_entry = ghb_fetch(&data->ghb, i + 1);
+		++i;
+		if (ghb_entry->just_modified == 0) {
+			i = 0;
+			++k;
+			if (k >= data->num_successors)
+				break;
+		}
+
+		int set_index = ghb_entry->addr % data->num_ways;
+		int j;
+		for (j = 0; j < data->num_ways; ++j) {
+			int index = set_index + j;
+			if (data->entries[index].addr == ghb_entry->addr) {
+				nrp_insert(data->entries[index].next[k]);
+				--attempts;
+			}
+		}
+	}
+
+	//clear modified flag
+	for (i = 0; i < loads; ++i) {
+		ghb_entry = ghb_fetch(&data->ghb, i + 1);
+		ghb_entry->just_modified = 0;
+	}
 }
 
 static void nrp_init() {
@@ -2112,6 +2294,7 @@ static void nrp_init() {
 	DEFINE_PREFETCH_MODE(STREAM_PREFETCH, stream);
 	DEFINE_PREFETCH_MODE(STRIDE_PREFETCH, stride);
 	DEFINE_PREFETCH_MODE(STRIDE_PREFETCH_PC, stride_PC);
+	DEFINE_PREFETCH_MODE(MARKOV_PREFETCH, markov);
 
 #undef DEFINE_PREFETCH_MODE
 
@@ -2146,38 +2329,6 @@ static void nrp_prefetch_process(md_addr_t PC, md_addr_t addr) {
 	if (nrp_prefetch_arr[nrp_mode].process_prefetch)
 		nrp_prefetch_arr[nrp_mode].process_prefetch(&nrp_prefetch_arr[nrp_mode], PC, addr);
 }
-
-/*
- * load/store queue (LSQ): holds loads and stores in program order, indicating
- * status of load/store access:
- *
- *   - issued: address computation complete, memory access in progress
- *   - completed: memory access has completed, stored value available
- *   - squashed: memory access was squashed, ignore this entry
- *
- * loads may execute when:
- *   1) register operands are ready, and
- *   2) memory operands are ready (no earlier unresolved store)
- *
- * loads are serviced by:
- *   1) previous store at same address in LSQ (hit latency), or
- *   2) data cache (hit latency + miss latency)
- *
- * stores may execute when:
- *   1) register operands are ready
- *
- * stores are serviced by:
- *   1) depositing store value into the load/store queue
- *   2) writing store value to the store buffer (plus tag check) at commit
- *   3) writing store buffer entry to data cache when cache is free
- *
- * NOTE: the load/store queue can bypass a store value to a load in the same
- *   cycle the store executes (using a bypass network), thus stores complete
- *   in effective zero time after their effective address is known
- */
-static struct RUU_station *LSQ;         /* load/store queue */
-static int LSQ_head, LSQ_tail;          /* LSQ head and tail pointers */
-static int LSQ_num;                     /* num entries currently in LSQ */
 
 /*
  * input dependencies for stores in the LSQ:
