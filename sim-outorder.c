@@ -1822,7 +1822,6 @@ static int nrp_insert(md_addr_t addr) {
 	return 0;
 }
 
-
 /* stream prefetching */
 static void nrp_prefetch_init_stream(struct NRP_prefetch_mode* this) {
 	this->data = malloc(sizeof(md_addr_t));
@@ -1846,6 +1845,38 @@ static void nrp_prefetch_stream(struct NRP_prefetch_mode* this) {
 
 	//perform prefetch
 	md_addr_t addr = *prefetch_address;
+	if (nrp_insert(addr))
+		addr = addr + 1;
+	*prefetch_address = addr;
+}
+
+/* stride prefetching */
+static void nrp_prefetch_init_stride(struct NRP_prefetch_mode* this) {
+	this->data = malloc(sizeof(md_addr_t)*2);
+	md_addr_t* data = this->data;
+	data[0] = data[1] = 1;
+}
+
+static void nrp_prefetch_cleanup_stride(struct NRP_prefetch_mode* this) {
+	free(this->data);
+}
+
+static void nrp_prefetch_process_stride(struct NRP_prefetch_mode* this, md_addr_t addr) {
+	md_addr_t* data = this->data;
+	md_addr_t* prefetch_address = data;
+	md_addr_t* stride = data + 1;
+	md_addr_t new_addr = addr + *stride;
+	if (!nrp_address_prefetched(new_addr))
+		*prefetch_address = new_addr;
+}
+
+static void nrp_prefetch_stride(struct NRP_prefetch_mode* this) {
+	md_addr_t* prefetch_address = this->data;
+	if (*prefetch_address == 0)
+		return;
+
+	//perform prefetch
+	md_addr_t addr = *prefetch_address;
 
 	do {
 		while (nrp_address_prefetched(addr))
@@ -1854,16 +1885,6 @@ static void nrp_prefetch_stream(struct NRP_prefetch_mode* this) {
 	*prefetch_address = addr;
 }
 
-/* stride prefetching */
-/*
-static void nrp_prefetch_process_stride(struct NRP_prefetch_mode* this, md_addr_t addr) {
-	md_addr_t* last_load_addr = addr;
-	int stride = addr - last_load_addr;
-	md_addr_t new_addr = addr + stride;
-	if (!nrp_address_prefetched(new_addr))
-		prefetch_address = new_addr;
-	last_load_addr = addr;
-}*/
 
 static void nrp_init() {
 	NRP_list = (struct NRP_station*)malloc(sizeof(struct NRP_station));
@@ -1888,6 +1909,7 @@ static void nrp_init() {
 	}
 
 	DEFINE_PREFETCH_MODE(STREAM_PREFETCH, stream);
+	DEFINE_PREFETCH_MODE(STREAM_PREFETCH, stride);
 
 #undef DEFINE_PREFETCH_MODE
 
