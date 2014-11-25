@@ -1915,10 +1915,10 @@ static int nrp_insert(md_addr_t addr) {
 		return 0;
 	}
 
-	if (lsq_address_exists(addr)) {
+	/*if (lsq_address_exists(addr)) {
 		NRP_attempt_fail_address_in_lsq++;
 		return 0;
-	}
+	}*/
 
 	/* is RUU full? */
 	if (NRP_num + RUU_num == RUU_size) {
