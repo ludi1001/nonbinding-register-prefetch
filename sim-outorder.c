@@ -1976,7 +1976,7 @@ static void ghb_insert(struct GHB* ghb, md_addr_t pc, md_addr_t addr) {
 static struct GHB_entry* ghb_fetch(struct GHB* ghb, int n) {
 	//fetch the nth one from the tail
 	int index = ghb->tail - n;
-	if (index < 0)
+	while (index < 0)
 		index += ghb->size;
 	return &ghb->buffer[index];
 }
@@ -2108,6 +2108,7 @@ static void nrp_prefetch_process_stride_PC(struct NRP_prefetch_mode* this, md_ad
 			data->RPT[index].stride = addr - data->RPT[index].last_load_addr;
 			data->RPT[index].last_load_addr = addr;
 			data->RPT[index].just_modified = 1;
+			break;
 		}
 	}
 	struct RPT_entry entry;
@@ -2122,7 +2123,9 @@ static void nrp_prefetch_process_stride_PC(struct NRP_prefetch_mode* this, md_ad
 		entry.just_modified = 1;
 	}
 	//shift every frame down a slot
-	for (i = i - 1; i > 0; --i)
+	if (i == data->ways)
+		i = i - 1;
+	for (; i > 0; --i)
 		data->RPT[set_index + i] = data->RPT[set_index + i - 1];
 	data->RPT[set_index] = entry;
 }
@@ -2148,7 +2151,7 @@ static void nrp_prefetch_init_markov(struct NRP_prefetch_mode* this) {
 	data->num_successors = nrp_markov_len;
 	int i = 0;
 	for (i = 0; i < nrp_rpt_size; ++i)
-		data->entries[i].next = malloc(sizeof(md_addr_t)* data->num_successors);
+		data->entries[i].next = malloc(sizeof(md_addr_t) * data->num_successors);
 
 	ghb_init(&data->ghb);
 }
@@ -2181,6 +2184,8 @@ static void nrp_prefetch_process_markov(struct NRP_prefetch_mode* this, md_addr_
 			}
 			//shuffle
 			int k;
+			if (j == data->num_successors)
+				j = j - 1;
 			for (k = j; k > 0; --k)
 				data->entries[index].next[k] = data->entries[index].next[k - 1];
 			data->entries[0].addr = addr;
@@ -2192,16 +2197,18 @@ static void nrp_prefetch_process_markov(struct NRP_prefetch_mode* this, md_addr_
 	int found = 0;
 	struct Markov_entry entry;
 	if (i != data->num_ways) {
-		entry.next = malloc(sizeof(md_addr_t)* data->num_successors);
+		entry.next = malloc(sizeof(md_addr_t) * data->num_successors);
 		entry.addr = data->entries[set_index + i].addr;
 		int k;
-		for (k = 0; i < data->num_successors; ++k)
+		for (k = 0; k < data->num_successors; ++k)
 			entry.next[k] = data->entries[set_index + i].next[k];
 		found = 1;
 	}
 
 	//shuffle
 	int k;
+	if (i == data->num_ways)
+		i = i - 1;
 	for (k = i; k > 0; --k) {
 		int index = set_index + k;
 		data->entries[index].addr = data->entries[index - 1].addr;
@@ -2215,6 +2222,7 @@ static void nrp_prefetch_process_markov(struct NRP_prefetch_mode* this, md_addr_
 		data->entries[index].addr = entry.addr;
 		for (k = 0; k < data->num_successors; ++k)
 			data->entries[index].next[k] = entry.next[k];
+		free(entry.next);
 	}
 	else {
 		data->entries[set_index].addr = ghb_entry->addr;
@@ -2231,14 +2239,19 @@ static void nrp_prefetch_markov(struct NRP_prefetch_mode* this) {
 	int loads = 0; //number of entries to look back
 	int i = 0; //generic counter
 	struct GHB_entry* ghb_entry = ghb_fetch(&data->ghb, i + 1);
-	while (ghb_entry->just_modified == 1)
+	while (i < data->ghb.size && ghb_entry->just_modified == 1) {
 		++i;
+		ghb_entry = ghb_fetch(&data->ghb, i + 1);
+	}
 	loads = i;
 
 	//calculate number of attempts: either limited by memports or by number of loads
 	int attempts = res_memport;
 	if (attempts > loads * data->num_successors)
 		attempts = loads * data->num_successors;
+	if (attempts > data->ghb.size)
+		attempts = data->ghb.size;
+
     i = 0;
 	int k = 0;
 	while (attempts > 0) {
@@ -2261,7 +2274,6 @@ static void nrp_prefetch_markov(struct NRP_prefetch_mode* this) {
 			}
 		}
 	}
-
 	//clear modified flag
 	for (i = 0; i < loads; ++i) {
 		ghb_entry = ghb_fetch(&data->ghb, i + 1);
@@ -2319,10 +2331,10 @@ static void nrp_cleanup() {
 
 /* issues prefetching operations */
 static void nrp_prefetch() {
-	if (nrp_prefetch_arr[nrp_mode].do_prefetch)
+	if (nrp_prefetch_arr[nrp_mode].do_prefetch) {
 		nrp_prefetch_arr[nrp_mode].do_prefetch(&nrp_prefetch_arr[nrp_mode]);
+	}
 }
-
 
 /* collects data for prefetching purposes */
 static void nrp_prefetch_process(md_addr_t PC, md_addr_t addr) {
@@ -3081,6 +3093,11 @@ ruu_writeback(void)
 
       /* operation has completed */
       rs->completed = TRUE;
+
+	  /* send to prefetcher */
+	  if (rs->ea_comp) { //is effective address comp?
+		  nrp_prefetch_process(rs->PC, rs->addr);
+	  }
 
       /* does this operation reveal a mis-predicted branch? */
       if (rs->recover_inst)
@@ -4626,7 +4643,7 @@ ruu_dispatch(void)
           rs->dir_update = *dir_update_ptr;
 	  rs->stack_recover_idx = stack_recover_idx;
 	  rs->spec_mode = spec_mode;
-	  rs->addr = 0;
+	  rs->addr = addr;
 	  /* rs->tag is already set */
 	  rs->seq = ++inst_seq;
 	  rs->queued = rs->issued = rs->completed = FALSE;
@@ -4658,11 +4675,6 @@ ruu_dispatch(void)
 	      lsq->seq = ++inst_seq;
 	      lsq->queued = lsq->issued = lsq->completed = FALSE;
 	      lsq->ptrace_seq = ptrace_seq++;
-
-		  /* process prefetch */
-		  if (MD_OP_FLAGS(op) & F_LOAD) {
-			  nrp_prefetch_process(regs.regs_PC, addr);
-		  }
 
 	      /* pipetrace this uop */
 	      ptrace_newuop(lsq->ptrace_seq, "internal ld/st", lsq->PC, 0);

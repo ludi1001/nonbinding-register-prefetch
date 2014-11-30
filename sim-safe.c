@@ -268,6 +268,8 @@ sim_main(void)
   enum md_opcode op;
   register int is_write;
   enum md_fault_type fault;
+  
+  FILE* fp = fopen("access", "w+");
 
   fprintf(stderr, "sim: ** starting functional simulation **\n");
 
@@ -339,6 +341,7 @@ sim_main(void)
 	  sim_num_refs++;
 	  if (MD_OP_FLAGS(op) & F_STORE)
 	    is_write = TRUE;
+      fprintf(fp, "%u\n", addr);
 	}
 
       /* check for DLite debugger entry condition */
