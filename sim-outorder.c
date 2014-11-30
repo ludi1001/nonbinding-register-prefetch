@@ -4643,7 +4643,7 @@ ruu_dispatch(void)
           rs->dir_update = *dir_update_ptr;
 	  rs->stack_recover_idx = stack_recover_idx;
 	  rs->spec_mode = spec_mode;
-	  rs->addr = addr;
+	  rs->addr = 0;// addr;
 	  /* rs->tag is already set */
 	  rs->seq = ++inst_seq;
 	  rs->queued = rs->issued = rs->completed = FALSE;
