@@ -1810,6 +1810,7 @@ enum {
 	STRIDE_PREFETCH_PC,
 	MARKOV_PREFETCH,
 	GHB_G_AC_PREFETCH,
+	GHB_G_DC_PREFETCH,
 	NUM_PREFETCH
 };
 
@@ -2030,6 +2031,8 @@ static void index_table_cleanup(struct NRP_index_table* table) {
 
 static int index_table_get_and_set(struct NRP_index_table* table, md_addr_t addr, int index) {
 	int set = addr % table->size;
+	if (set < 0)
+		set += table->size;
 	int old_index = table->table[set].index;
 	table->table[set].index = index;
 	if (table->table[set].addr == addr)
@@ -2380,6 +2383,50 @@ static void nrp_prefetch_ghb_g_ac(struct NRP_prefetch_mode* this) {
 	}
 }
 
+/* GHB G/DC */
+
+static void nrp_prefetch_init_ghb_g_dc(struct NRP_prefetch_mode* this) {
+	this->data = malloc(sizeof(struct NRP_prefetch_mode_GHB));
+	struct NRP_prefetch_mode_GHB* data = this->data;
+	ghb_init(&data->ghb);
+	index_table_init(&data->itable);
+}
+
+static void nrp_prefetch_cleanup_ghb_g_dc(struct NRP_prefetch_mode* this) {
+	struct NRP_prefetch_mode_GHB* data = this->data;
+	ghb_cleanup(&data->ghb);
+	index_table_cleanup(&data->itable);
+}
+
+static void nrp_prefetch_process_ghb_g_dc(struct NRP_prefetch_mode* this, md_addr_t PC, md_addr_t addr) {
+	struct NRP_prefetch_mode_GHB* data = this->data;
+	struct GHB_entry* prev_ghb_entry = ghb_fetch(&data->ghb, 1);
+	struct GHB_entry* ghb_entry = ghb_insert(&data->ghb, PC, addr);
+	int delta = ghb_entry->addr - prev_ghb_entry->addr;
+	int index = index_table_get_and_set(&data->itable, delta, ghb_entry->entry_id);
+	if (index != -1) {
+		ghb_entry->last_entry_index = index;
+	}
+}
+
+static void nrp_prefetch_ghb_g_dc(struct NRP_prefetch_mode* this) {
+	struct NRP_prefetch_mode_GHB* data = this->data;
+	int i = 1;
+	while (i < data->ghb.size) {
+		struct GHB_entry* entry = ghb_fetch(&data->ghb, i);
+		if (entry->just_modified == 1) {
+			entry->just_modified = 0;
+			if (data->ghb.entry_id - entry->last_entry_index < data->ghb.size) {
+				int delta = ghb_fetch_from(&data->ghb, entry->last_entry_index, 1)->addr - ghb_fetch_from(&data->ghb, entry->last_entry_index, 0)->addr;
+				nrp_insert(entry->addr + delta);
+			}
+		}
+		else
+			break;
+		++i;
+	}
+}
+
 static void nrp_init() {
 	NRP_list = (struct NRP_station*)malloc(sizeof(struct NRP_station));
 	NRP_list->busy = -1;
@@ -2407,6 +2454,7 @@ static void nrp_init() {
 	DEFINE_PREFETCH_MODE(STRIDE_PREFETCH_PC, stride_PC);
 	DEFINE_PREFETCH_MODE(MARKOV_PREFETCH, markov);
 	DEFINE_PREFETCH_MODE(GHB_G_AC_PREFETCH, ghb_g_ac);
+	DEFINE_PREFETCH_MODE(GHB_G_DC_PREFETCH, ghb_g_dc);
 
 #undef DEFINE_PREFETCH_MODE
 
