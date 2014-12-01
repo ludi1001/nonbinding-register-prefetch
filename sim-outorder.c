@@ -227,6 +227,7 @@ static int nrp_rpt_size;
 static int nrp_rpt_assoc;
 static int nrp_markov_len;
 static int nrp_ghb_size;
+static int nrp_itable_size;
 
 /* text-based stat profiles */
 #define MAX_PCSTAT_VARS 8
@@ -901,6 +902,7 @@ sim_reg_options(struct opt_odb_t *odb)
   opt_reg_int(odb, "-nrp:rptassoc", "NRP RPT associativity", &nrp_rpt_assoc, 1, TRUE, NULL);
   opt_reg_int(odb, "-nrp:markovlen", "NRP Markov", &nrp_markov_len, 4, TRUE, NULL);
   opt_reg_int(odb, "-nrp:ghbsize", "GHB size", &nrp_ghb_size, 16, TRUE, NULL);
+  opt_reg_int(odb, "-nrp:itablesize", "index table size", &nrp_itable_size, 16, TRUE, NULL);
 }
 
 /* check simulator-specific option values */
@@ -1728,12 +1730,15 @@ struct NRP_station {
 struct GHB_entry {
 	md_addr_t pc;
 	md_addr_t addr;
+	int last_entry_index;
 	int just_modified;
+	int entry_id;
 };
 
 struct GHB {
 	int tail;
 	int size;
+	int entry_id;
 	struct GHB_entry* buffer;
 };
 
@@ -1778,6 +1783,25 @@ struct NRP_prefetch_mode_markov {
 	struct Markov_entry* entries;
 };
 
+struct NRP_addr_list {
+	md_addr_t addr;
+	struct NRP_addr_list* next;
+};
+
+struct NRP_index_table_entry {
+	md_addr_t addr;
+	int index;
+};
+
+struct NRP_index_table {
+	int size;
+	struct NRP_index_table_entry* table;
+};
+
+struct NRP_prefetch_mode_GHB {
+	struct NRP_index_table itable;
+	struct GHB ghb;
+};
 
 enum {
 	NO_PREFETCH,
@@ -1785,6 +1809,7 @@ enum {
 	STRIDE_PREFETCH,
 	STRIDE_PREFETCH_PC,
 	MARKOV_PREFETCH,
+	GHB_G_AC_PREFETCH,
 	NUM_PREFETCH
 };
 
@@ -1847,7 +1872,7 @@ static int lsq_address_exists(md_addr_t addr) {
 	while (num)
 	{
 		rs = &LSQ[head];
-		if (rs->addr == addr)
+		if (rs->addr == addr && rs->issued) //only if address matches and already issued does it count
 			return 1;
 		head = (head + 1) % LSQ_size;
 		num--;
@@ -1915,10 +1940,10 @@ static int nrp_insert(md_addr_t addr) {
 		return 0;
 	}
 
-	/*if (lsq_address_exists(addr)) {
+	if (lsq_address_exists(addr)) {
 		NRP_attempt_fail_address_in_lsq++;
 		return 0;
-	}*/
+	}
 
 	/* is RUU full? */
 	if (NRP_num + RUU_num == RUU_size) {
@@ -1958,6 +1983,7 @@ static void ghb_init(struct GHB* ghb) {
 	ghb->size = nrp_ghb_size;
 	ghb->tail = 0;
 	ghb->buffer = malloc(sizeof(struct GHB_entry) * nrp_ghb_size);
+	ghb->entry_id = 0;
 	memset(ghb->buffer, 0, sizeof(struct GHB_entry) * nrp_ghb_size);
 }
 
@@ -1965,12 +1991,15 @@ static void ghb_cleanup(struct GHB* ghb) {
 	free(ghb->buffer);
 }
 
-static void ghb_insert(struct GHB* ghb, md_addr_t pc, md_addr_t addr) {
+static struct GHB_entry* ghb_insert(struct GHB* ghb, md_addr_t pc, md_addr_t addr) {
 	ghb->buffer[ghb->tail].pc = pc;
 	ghb->buffer[ghb->tail].addr = addr;
 	ghb->buffer[ghb->tail].just_modified = 1;
+	ghb->buffer[ghb->tail].entry_id = ghb->entry_id++;
 
+	struct GHB_entry* entry = &ghb->buffer[ghb->tail];
 	ghb->tail = (ghb->tail + 1) % ghb->size;
+	return entry;
 }
 
 static struct GHB_entry* ghb_fetch(struct GHB* ghb, int n) {
@@ -1979,6 +2008,36 @@ static struct GHB_entry* ghb_fetch(struct GHB* ghb, int n) {
 	while (index < 0)
 		index += ghb->size;
 	return &ghb->buffer[index];
+}
+
+static struct GHB_entry* ghb_fetch_from(struct GHB* ghb, int index, int offset) {
+	int true_index = (index + offset) % ghb->size;
+	if (true_index < 0)
+		true_index += ghb->size;
+	return &ghb->buffer[true_index];
+}
+
+/* index table for GHB */
+static void index_table_init(struct NRP_index_table* table) {
+	table->size = nrp_itable_size;
+	table->table = malloc(sizeof(struct NRP_index_table_entry) * nrp_itable_size);
+	memset(table->table, 0, sizeof(struct NRP_index_table_entry) * nrp_itable_size);
+}
+
+static void index_table_cleanup(struct NRP_index_table* table) {
+	free(table->table);
+}
+
+static int index_table_get_and_set(struct NRP_index_table* table, md_addr_t addr, int index) {
+	int set = addr % table->size;
+	int old_index = table->table[set].index;
+	table->table[set].index = index;
+	if (table->table[set].addr == addr)
+		return old_index;
+	else {
+		table->table[set].addr = addr;
+		return -1;
+	}
 }
 
 /* stream prefetching */
@@ -2281,6 +2340,46 @@ static void nrp_prefetch_markov(struct NRP_prefetch_mode* this) {
 	}
 }
 
+/* GHB G/AC */
+static void nrp_prefetch_init_ghb_g_ac(struct NRP_prefetch_mode* this) {
+	this->data = malloc(sizeof(struct NRP_prefetch_mode_GHB));
+	struct NRP_prefetch_mode_GHB* data = this->data;
+	ghb_init(&data->ghb);
+	index_table_init(&data->itable);
+}
+
+static void nrp_prefetch_cleanup_ghb_g_ac(struct NRP_prefetch_mode* this) {
+	struct NRP_prefetch_mode_GHB* data = this->data;
+	ghb_cleanup(&data->ghb);
+	index_table_cleanup(&data->itable);
+}
+
+static void nrp_prefetch_process_ghb_g_ac(struct NRP_prefetch_mode* this, md_addr_t PC, md_addr_t addr) {
+	struct NRP_prefetch_mode_GHB* data = this->data;
+	struct GHB_entry* ghb_entry = ghb_insert(&data->ghb, PC, addr);
+	int index = index_table_get_and_set(&data->itable, addr, ghb_entry->entry_id);
+	if (index != -1) {
+		ghb_entry->last_entry_index = index;
+	}
+}
+
+static void nrp_prefetch_ghb_g_ac(struct NRP_prefetch_mode* this) {
+	struct NRP_prefetch_mode_GHB* data = this->data;
+	int i = 1;
+	while (i < data->ghb.size) {
+		struct GHB_entry* entry = ghb_fetch(&data->ghb, i);
+		if (entry->just_modified == 1) {
+			entry->just_modified = 0;
+			if (data->ghb.entry_id - entry->last_entry_index < data->ghb.size) {
+				nrp_insert(ghb_fetch_from(&data->ghb, entry->last_entry_index, 1)->addr);
+			}
+		}
+		else
+			break;
+		++i;
+	}
+}
+
 static void nrp_init() {
 	NRP_list = (struct NRP_station*)malloc(sizeof(struct NRP_station));
 	NRP_list->busy = -1;
@@ -2307,6 +2406,7 @@ static void nrp_init() {
 	DEFINE_PREFETCH_MODE(STRIDE_PREFETCH, stride);
 	DEFINE_PREFETCH_MODE(STRIDE_PREFETCH_PC, stride_PC);
 	DEFINE_PREFETCH_MODE(MARKOV_PREFETCH, markov);
+	DEFINE_PREFETCH_MODE(GHB_G_AC_PREFETCH, ghb_g_ac);
 
 #undef DEFINE_PREFETCH_MODE
 
@@ -4643,7 +4743,7 @@ ruu_dispatch(void)
           rs->dir_update = *dir_update_ptr;
 	  rs->stack_recover_idx = stack_recover_idx;
 	  rs->spec_mode = spec_mode;
-	  rs->addr = 0;// addr;
+	  rs->addr = addr;
 	  /* rs->tag is already set */
 	  rs->seq = ++inst_seq;
 	  rs->queued = rs->issued = rs->completed = FALSE;
