@@ -228,6 +228,8 @@ static int nrp_rpt_assoc;
 static int nrp_markov_len;
 static int nrp_ghb_size;
 static int nrp_itable_size;
+static int nrp_submode;
+static int nrp_addr_stack_size;
 
 /* text-based stat profiles */
 #define MAX_PCSTAT_VARS 8
@@ -903,6 +905,8 @@ sim_reg_options(struct opt_odb_t *odb)
   opt_reg_int(odb, "-nrp:markovlen", "NRP Markov", &nrp_markov_len, 4, TRUE, NULL);
   opt_reg_int(odb, "-nrp:ghbsize", "GHB size", &nrp_ghb_size, 16, TRUE, NULL);
   opt_reg_int(odb, "-nrp:itablesize", "index table size", &nrp_itable_size, 16, TRUE, NULL);
+  opt_reg_int(odb, "-nrp:submode", "NRP submode", &nrp_submode, 0, TRUE, NULL);
+  opt_reg_int(odb, "-nrp:stacksize", "NRP address stack size", &nrp_addr_stack_size, 16, TRUE, NULL);
 }
 
 /* check simulator-specific option values */
@@ -1747,6 +1751,7 @@ struct NRP_prefetch_mode {
 	void(*cleanup)(struct NRP_prefetch_mode*);
 	void(*process_prefetch)(struct NRP_prefetch_mode*, md_addr_t, md_addr_t);
 	void(*do_prefetch)(struct NRP_prefetch_mode*);
+	void(*early_process_prefetch)(struct NRP_prefetch_mode*, md_addr_t);
 	void* data;
 };
 
@@ -1764,10 +1769,25 @@ struct RPT_entry {
 	int just_modified;
 };
 
+struct NRP_addr_list {
+	md_addr_t addr;
+	struct NRP_addr_list* next;
+};
+
 struct NRP_prefetch_mode_stride_PC {
 	int sets;
 	int ways;
 	struct RPT_entry* RPT;
+};
+
+struct NRP_prefetch_mode_early_stride_PC {
+	int sets;
+	int ways;
+	struct RPT_entry* RPT;
+	md_addr_t* addr_stack;
+	int tos;
+	int bos;
+	int addr_stack_size;
 };
 
 struct Markov_entry {
@@ -1781,11 +1801,6 @@ struct NRP_prefetch_mode_markov {
 	int num_successors;
 	struct GHB ghb;
 	struct Markov_entry* entries;
-};
-
-struct NRP_addr_list {
-	md_addr_t addr;
-	struct NRP_addr_list* next;
 };
 
 struct NRP_index_table_entry {
@@ -1811,6 +1826,7 @@ enum {
 	MARKOV_PREFETCH,
 	GHB_G_AC_PREFETCH,
 	GHB_G_DC_PREFETCH,
+	EARLY_STRIDE_PREFETCH_PC,
 	NUM_PREFETCH
 };
 
@@ -2116,7 +2132,7 @@ static void nrp_prefetch_stride(struct NRP_prefetch_mode* this) {
 
 /* baer chen RPT stride prefetching */
 static void nrp_prefetch_init_stride_PC(struct NRP_prefetch_mode* this) {
-	this->data = malloc(sizeof(struct NRP_prefetch_mode_stride));
+	this->data = malloc(sizeof(struct NRP_prefetch_mode_stride_PC));
 	struct NRP_prefetch_mode_stride_PC* data = this->data;
 	data->RPT = malloc(sizeof(struct RPT_entry) * nrp_rpt_size);
 	data->ways = nrp_rpt_assoc;
@@ -2201,6 +2217,119 @@ static void nrp_prefetch_stride_PC(struct NRP_prefetch_mode* this) {
 		}
 		data->RPT[i].just_modified = 0;
 	}
+}
+
+/* early baer chen RPT stride prefetching */
+static void nrp_prefetch_init_early_stride_PC(struct NRP_prefetch_mode* this) {
+	this->data = malloc(sizeof(struct NRP_prefetch_mode_early_stride_PC));
+	struct NRP_prefetch_mode_early_stride_PC* data = this->data;
+	data->RPT = malloc(sizeof(struct RPT_entry) * nrp_rpt_size);
+	data->ways = nrp_rpt_assoc;
+	data->sets = nrp_rpt_size / nrp_rpt_assoc;
+	int i;
+	for (i = 0; i < nrp_rpt_size; ++i) {
+		data->RPT[i].state = 0;
+		data->RPT[i].just_modified = 0;
+	}
+	data->addr_stack_size = nrp_addr_stack_size;
+	data->addr_stack = malloc(sizeof(md_addr_t)* data->addr_stack_size);
+	data->bos = data->tos = 0;
+}
+
+static void nrp_prefetch_cleanup_early_stride_PC(struct NRP_prefetch_mode* this) {
+	struct NRP_prefetch_mode_early_stride_PC* data = this->data;
+	free(data->RPT);
+	free(this->data);
+}
+
+static void nrp_prefetch_process_early_stride_PC(struct NRP_prefetch_mode* this, md_addr_t PC, md_addr_t addr) {
+	struct NRP_prefetch_mode_early_stride_PC* data = this->data;
+	int set_index = (PC % data->sets) * data->ways;
+	//search for pc
+	int i;
+	for (i = 0; i < data->ways; ++i) {
+		int index = set_index + i;
+		if (data->RPT[index].last_pc == PC) {
+			md_addr_t pred_addr = data->RPT[index].last_load_addr + data->RPT[index].stride;
+			if (data->RPT[index].state == 0) { //initial
+				if (pred_addr == addr)
+					data->RPT[index].state = 2;
+				else
+					data->RPT[index].state = 1;
+			}
+			else if (data->RPT[index].state == 1) { //transient
+				if (pred_addr == addr)
+					data->RPT[index].state = 2;
+				else
+					data->RPT[index].state = 3;
+			}
+			else if (data->RPT[index].state == 2) { //steady
+				if (pred_addr == addr)
+					data->RPT[index].state = 2;
+				else
+					data->RPT[index].state = 0;
+			}
+			else { //no pred
+				if (pred_addr == addr)
+					data->RPT[index].state = 1;
+				else
+					data->RPT[index].state = 3;
+			}
+			data->RPT[index].stride = addr - data->RPT[index].last_load_addr;
+			data->RPT[index].last_load_addr = addr;
+			data->RPT[index].just_modified = 1;
+			break;
+		}
+	}
+	struct RPT_entry entry;
+	if (i < data->ways) {
+		entry = data->RPT[set_index + i];
+	}
+	else {
+		entry.last_pc = PC;
+		entry.state = 0;
+		entry.stride = 1;
+		entry.last_load_addr = addr;
+		entry.just_modified = 1;
+	}
+	//shift every frame down a slot
+	if (i == data->ways)
+		i = i - 1;
+	for (; i > 0; --i)
+		data->RPT[set_index + i] = data->RPT[set_index + i - 1];
+	data->RPT[set_index] = entry;
+}
+
+static void nrp_prefetch_early_stride_PC(struct NRP_prefetch_mode* this) {
+	struct NRP_prefetch_mode_early_stride_PC* data = this->data;
+	int fetches = res_memport;
+	while (fetches-- > 0 && data->tos != data->bos) {
+		data->tos = (data->tos - 1 + data->addr_stack_size) % data->addr_stack_size;
+		nrp_insert(data->addr_stack[data->tos]);
+	}
+}
+
+static void nrp_early_prefetch_early_stride_PC(struct NRP_prefetch_mode* this, md_addr_t PC) {
+	struct NRP_prefetch_mode_early_stride_PC* data = this->data;
+	int set_index = (PC % data->sets) * data->ways;
+	int i;
+	for (i = 0; i < data->ways; ++i) {
+		int index = set_index + i;
+		if (data->RPT[index].last_pc == PC) {
+			if (data->RPT[i].state == 2 || data->RPT[i].state == 1 || nrp_submode == 0) {
+				data->addr_stack[data->tos] = data->RPT[index].last_load_addr + data->RPT[index].stride;
+				data->tos += 1;
+				data->tos %= data->addr_stack_size;
+				if (data->tos == data->bos) {
+					//move bottom of stack if necessary
+					data->bos += 1;
+					data->bos %= data->addr_stack_size;
+				}
+			}
+			break;
+		}
+	}
+
 }
 
 /* markov prefetching */
@@ -2447,6 +2576,7 @@ static void nrp_init() {
 	nrp_prefetch_arr[index].cleanup = nrp_prefetch_cleanup_##name; \
 	nrp_prefetch_arr[index].process_prefetch = nrp_prefetch_process_##name; \
 	nrp_prefetch_arr[index].do_prefetch = nrp_prefetch_##name; \
+	nrp_prefetch_arr[index].early_process_prefetch = NULL; \
 	}
 
 	DEFINE_PREFETCH_MODE(STREAM_PREFETCH, stream);
@@ -2455,6 +2585,8 @@ static void nrp_init() {
 	DEFINE_PREFETCH_MODE(MARKOV_PREFETCH, markov);
 	DEFINE_PREFETCH_MODE(GHB_G_AC_PREFETCH, ghb_g_ac);
 	DEFINE_PREFETCH_MODE(GHB_G_DC_PREFETCH, ghb_g_dc);
+	DEFINE_PREFETCH_MODE(EARLY_STRIDE_PREFETCH_PC, early_stride_PC);
+	nrp_prefetch_arr[EARLY_STRIDE_PREFETCH_PC].early_process_prefetch = nrp_early_prefetch_early_stride_PC;
 
 #undef DEFINE_PREFETCH_MODE
 
@@ -2488,6 +2620,12 @@ static void nrp_prefetch() {
 static void nrp_prefetch_process(md_addr_t PC, md_addr_t addr) {
 	if (nrp_prefetch_arr[nrp_mode].process_prefetch)
 		nrp_prefetch_arr[nrp_mode].process_prefetch(&nrp_prefetch_arr[nrp_mode], PC, addr);
+}
+
+/* collects data for early prefetching */
+static void nrp_early_prefetch_process(md_addr_t PC) {
+	if (nrp_prefetch_arr[nrp_mode].early_process_prefetch)
+		nrp_prefetch_arr[nrp_mode].early_process_prefetch(&nrp_prefetch_arr[nrp_mode], PC);
 }
 
 /*
@@ -5090,6 +5228,9 @@ ruu_fetch(void)
 	{
 	  /* read instruction from memory */
 	  MD_FETCH_INST(inst, mem, fetch_regs_PC);
+
+	  /* do early prefetching! */
+	  nrp_early_prefetch_process(fetch_regs_PC);
 
 	  /* address is within program text, read instruction from memory */
 	  lat = cache_il1_lat;
