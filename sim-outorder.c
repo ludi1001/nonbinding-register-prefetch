@@ -361,6 +361,10 @@ static counter_t NRP_fetch_attempts;
 static counter_t NRP_attempt_fail_address_in_nrp;
 static counter_t NRP_attempt_fail_address_in_lsq;
 static counter_t NRP_attempt_fail_RUU_full;
+static counter_t NRP_addr_in_stack_count;
+static counter_t NRP_addr_stack_add_count;
+static counter_t NRP_addr_stack_count;
+static counter_t NRP_addr_stack_full;
 
 /* total non-speculative bogus addresses seen (debug var) */
 static counter_t sim_invalid_addrs;
@@ -1344,6 +1348,14 @@ sim_reg_stats(struct stat_sdb_t *sdb)   /* stats database */
   stat_reg_formula(sdb, "nrp_fail_RUU_full", "prop of failed prefetch b/c RUU full", "NRP_attempt_fail_RUU_full / nrp_failed_fetches", NULL);
   stat_reg_counter(sdb, "NRP_fetch_miss_count", "number of prefetch attempts to data not in L1", &NRP_fetch_miss_count, 0, NULL);
   stat_reg_formula(sdb, "nrp_fetch_miss_prop", "proportion of prefetch attempts that miss in L1", "NRP_fetch_miss_count / NRP_fetch_attempts", NULL);
+  stat_reg_counter(sdb, "NRP_addr_stack_count", "total number of addr in stack", &NRP_addr_stack_count, 0, NULL);
+  stat_reg_formula(sdb, "nrp_addr_stack_avg_occupancy", "avg number of addr in stack", "NRP_addr_stack_count / sim_cycle", NULL);
+  stat_reg_counter(sdb, "NRP_addr_stack_full", "total number of evictions from stack", &NRP_addr_stack_full, 0, NULL);
+  stat_reg_formula(sdb, "nrp_addr_stack_full_rate", "stack eviction rate", "NRP_addr_stack_full / sim_cycle", NULL);
+  stat_reg_counter(sdb, "NRP_addr_stack_add_count", "number of addresses added to stack", &NRP_addr_stack_add_count, 0, NULL);
+  stat_reg_formula(sdb, "nrp_addr_stack_add_rate", "rate addr added to stack", "NRP_addr_stack_add_count / sim_cycle", NULL);
+  stat_reg_counter(sdb, "NRP_addr_in_stack_count", "number of prefetch attempts that already exist in stack", &NRP_addr_in_stack_count, 0, NULL);
+  stat_reg_formula(sdb, "nrp_fetch_in_addr_stack_rate", "duplicate addr number / total added", "NRP_addr_in_stack_count / NRP_addr_stack_add_count", NULL);
 
   stat_reg_formula(sdb, "ruu_true_count", "RUU count + NRP count", "NRP_count + RUU_count", NULL);
   stat_reg_formula(sdb, "ruu_true_occupany", "avg RUU occupancy", "ruu_true_count / sim_cycle", NULL);
@@ -1954,12 +1966,12 @@ static int nrp_insert(md_addr_t addr) {
 
 	if (nrp_address_prefetched(addr)) {
 		NRP_attempt_fail_address_in_nrp++;
-		return 0;
+		return -1;
 	}
 
 	if (lsq_address_exists(addr)) {
 		NRP_attempt_fail_address_in_lsq++;
-		return 0;
+		return -1;
 	}
 
 	/* is RUU full? */
@@ -2305,7 +2317,10 @@ static void nrp_prefetch_early_stride_PC(struct NRP_prefetch_mode* this) {
 	int fetches = res_memport;
 	while (fetches-- > 0 && data->tos != data->bos) {
 		data->tos = (data->tos - 1 + data->addr_stack_size) % data->addr_stack_size;
-		nrp_insert(data->addr_stack[data->tos]);
+		if (nrp_insert(data->addr_stack[data->tos]) == 0) {
+			data->tos = (data->tos + 1) % data->addr_stack_size;
+			break;
+		}
 	}
 }
 
@@ -2316,15 +2331,36 @@ static void nrp_early_prefetch_early_stride_PC(struct NRP_prefetch_mode* this, m
 	for (i = 0; i < data->ways; ++i) {
 		int index = set_index + i;
 		if (data->RPT[index].last_pc == PC) {
-			if (data->RPT[i].state == 2 || data->RPT[i].state == 1 || nrp_submode == 0) {
-				data->addr_stack[data->tos] = data->RPT[index].last_load_addr + data->RPT[index].stride;
+			if (data->RPT[i].state == 2 || data->RPT[i].state == 1 || nrp_submode == 1) {
+				md_addr_t addr = data->RPT[index].last_load_addr + data->RPT[index].stride;
+
+				//check to see if address already in stack
+				int j = data->bos;
+				while (j != data->tos) {
+					if (data->addr_stack[j] == addr) {
+						++NRP_addr_in_stack_count;
+						break;
+					}
+					j = (j + 1) % data->addr_stack_size;
+				}
+
+				data->addr_stack[data->tos] = addr;
 				data->tos += 1;
 				data->tos %= data->addr_stack_size;
 				if (data->tos == data->bos) {
 					//move bottom of stack if necessary
 					data->bos += 1;
 					data->bos %= data->addr_stack_size;
+
+					++NRP_addr_stack_full;
 				}
+				++NRP_addr_stack_add_count;
+				
+				//figure out how many elements in stack
+				int stack_count = data->tos - data->bos;
+				if (stack_count < 0)
+					stack_count += data->addr_stack_size;
+				NRP_addr_stack_count += stack_count;
 			}
 			break;
 		}
