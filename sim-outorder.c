@@ -2533,18 +2533,40 @@ static void nrp_prefetch_process_ghb_g_ac(struct NRP_prefetch_mode* this, md_add
 
 static void nrp_prefetch_ghb_g_ac(struct NRP_prefetch_mode* this) {
 	struct NRP_prefetch_mode_GHB* data = this->data;
+	struct GHB_entry* entry = ghb_fetch(&data->ghb, 1);
+	if (!entry->just_modified)
+		return;
 	int i = 1;
-	while (i < data->ghb.size) {
-		struct GHB_entry* entry = ghb_fetch(&data->ghb, i);
-		if (entry->just_modified == 1) {
-			entry->just_modified = 0;
-			if (data->ghb.entry_id - entry->last_entry_index < data->ghb.size) {
-				nrp_insert(ghb_fetch_from(&data->ghb, entry->last_entry_index, 1)->addr);
-			}
+	int attempted = 0;
+	int j = 1;
+	while (i < data->ghb.size && attempted < res_memport) {
+		if (i >= data->ghb.size) {
+			i = 1;
+			++j;
 		}
-		else
-			break;
+		entry = ghb_fetch(&data->ghb, i);
+		if (entry->just_modified == 1) {
+
+			if (data->ghb.entry_id - entry->last_entry_index < data->ghb.size) {
+				if(nrp_insert(ghb_fetch_from(&data->ghb, entry->last_entry_index, j)->addr) == 0)
+					break;
+			}
+			++attempted;
+		}
+		else {
+			i = 1;
+			++j;
+			if (j > res_memport)
+				break;
+		}
 		++i;
+	}
+	i = 1;
+	entry = ghb_fetch(&data->ghb, i);
+	while (i < data->ghb.size && entry->just_modified == 1) {
+		entry->just_modified = 0;
+		++i;
+		entry = ghb_fetch(&data->ghb, i);
 	}
 }
 
@@ -2574,6 +2596,7 @@ static void nrp_prefetch_process_ghb_g_dc(struct NRP_prefetch_mode* this, md_add
 	}
 }
 
+/*
 static void nrp_prefetch_ghb_g_dc(struct NRP_prefetch_mode* this) {
 	struct NRP_prefetch_mode_GHB* data = this->data;
 	int i = 1;
@@ -2589,6 +2612,47 @@ static void nrp_prefetch_ghb_g_dc(struct NRP_prefetch_mode* this) {
 		else
 			break;
 		++i;
+	}
+}
+*/
+
+static void nrp_prefetch_ghb_g_dc(struct NRP_prefetch_mode* this) {
+	struct NRP_prefetch_mode_GHB* data = this->data;
+	struct GHB_entry* entry = ghb_fetch(&data->ghb, 1);
+	if (!entry->just_modified)
+		return;
+	int i = 1;
+	int attempted = 0;
+	int j = 1;
+	while (i < data->ghb.size && attempted < res_memport) {
+		if (i >= data->ghb.size) {
+			i = 1;
+			++j;
+		}
+		entry = ghb_fetch(&data->ghb, i);
+		if (entry->just_modified == 1) {
+
+			if (data->ghb.entry_id - entry->last_entry_index < data->ghb.size) {
+				int delta = ghb_fetch_from(&data->ghb, entry->last_entry_index, j)->addr - ghb_fetch_from(&data->ghb, entry->last_entry_index, 0)->addr;
+				if (nrp_insert(entry->addr + delta) == 0)
+					break;
+			}
+			++attempted;
+		}
+		else {
+			i = 1;
+			++j;
+			if (j > res_memport)
+				break;
+		}
+		++i;
+	}
+	i = 1;
+	entry = ghb_fetch(&data->ghb, i);
+	while (i < data->ghb.size && entry->just_modified == 1) {
+		entry->just_modified = 0;
+		++i;
+		entry = ghb_fetch(&data->ghb, i);
 	}
 }
 
